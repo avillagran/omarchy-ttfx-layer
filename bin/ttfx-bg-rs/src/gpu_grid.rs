@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 
 use anyhow::{anyhow, Result};
-use gtk4::cairo::{Context, FontSlant, FontWeight, Format, ImageSurface};
+use gtk4::cairo::{Context, Format, ImageSurface};
+use gtk4::pango;
 
 use crate::DirectCell;
 
@@ -297,7 +298,10 @@ impl GpuGrid {
         Ok(Some(slot))
     }
 
-    // Same glyph construction as the CPU atlas, at device resolution.
+    // Same glyph construction as the CPU atlas, at device resolution. Pango
+    // does the font fallback: the cairo toy API draws one face only, which
+    // turns katakana (matrix) into boxes on systems whose monospace font
+    // lacks them.
     fn rasterize_mask(&self, ch: char, attrs: u64) -> Result<Vec<u8>> {
         let (cw, chh) = (self.cell_w, self.cell_h);
         let mut surface = ImageSurface::create(Format::A8, cw, chh)?;
@@ -307,16 +311,22 @@ impl GpuGrid {
             if ch == '█' {
                 cr.paint()?;
             } else {
-                let weight = if attrs & 1 != 0 { FontWeight::Bold } else { FontWeight::Normal };
-                cr.select_font_face("monospace", FontSlant::Normal, weight);
                 let font = self.device_font.min(chh as f64 * 0.95);
-                cr.set_font_size(font);
                 let baseline = (chh as f64 - font) * 0.5 + font;
-                if attrs & 2 != 0 {
-                    cr.transform(gtk4::cairo::Matrix::new(1.0, 0.0, -0.22, 1.0, chh as f64 * 0.22, 0.0));
+                let mut desc = pango::FontDescription::from_string("monospace");
+                desc.set_absolute_size(font * pango::SCALE as f64);
+                if attrs & 1 != 0 {
+                    desc.set_weight(pango::Weight::Bold);
                 }
-                cr.move_to(0.0, baseline);
-                cr.show_text(&ch.to_string())?;
+                if attrs & 2 != 0 {
+                    desc.set_style(pango::Style::Italic);
+                }
+                let layout = pangocairo::functions::create_layout(&cr);
+                layout.set_font_description(Some(&desc));
+                layout.set_text(&ch.to_string());
+                let layout_baseline = layout.baseline() as f64 / pango::SCALE as f64;
+                cr.move_to(0.0, baseline - layout_baseline);
+                pangocairo::functions::show_layout(&cr, &layout);
                 if attrs & (4 | 64) != 0 {
                     cr.set_line_width((font / 12.0).max(1.0));
                     if attrs & 4 != 0 {

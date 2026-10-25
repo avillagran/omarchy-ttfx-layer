@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 gtk4 = { version = "0.10", features = ["v4_16"] }
 gtk4-layer-shell = "0.6"
+pangocairo = "0.21"
 vte4 = { version = "0.9", optional = true }
 gio = "0.20"
 glib = "0.20"
