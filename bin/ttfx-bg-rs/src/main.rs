@@ -21,6 +21,7 @@ mod bars_layout;
 mod direct_glyph_atlas;
 mod frame_cadence;
 mod frame_handoff;
+mod fps_governor;
 mod frame_wakeup;
 mod gpu_grid;
 mod occlusion;
@@ -193,6 +194,7 @@ fn speed_delay(baseline: Duration, speed: i64) -> Duration {
 const MIN_RENDER_FRAME: Duration = Duration::from_micros(16_667);
 
 fn render_frame_interval(intended: Duration, direct: bool) -> Duration {
+    fps_governor::note_tick();
     let interval = if direct {
         intended
     } else {
@@ -204,18 +206,11 @@ fn render_frame_interval(intended: Duration, direct: bool) -> Duration {
     }
 }
 
-// Optional user ceiling (TTFX_BG_MAX_FPS). Old machines run hot at 60fps; the
-// effect speed setting still controls animation timing below the ceiling.
+// Optional user ceiling (TTFX_BG_MAX_FPS): a number, or `auto` to let the
+// governor pick one from the measured CPU cost per frame. The effect speed
+// setting still controls animation timing below the ceiling.
 fn max_fps() -> Option<f64> {
-    static MAX_FPS: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    *MAX_FPS.get_or_init(|| parse_max_fps(std::env::var("TTFX_BG_MAX_FPS").ok().as_deref()))
-}
-
-fn parse_max_fps(value: Option<&str>) -> Option<f64> {
-    value
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|fps| fps.is_finite() && *fps >= 1.0)
-        .map(|fps| fps.min(240.0))
+    fps_governor::cap()
 }
 
 // --- Auto-degrade: detect sustained FPS drops and coarsen the grid -------------
@@ -934,6 +929,10 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "vte"))]
         std::process::exit(2);
     }
+    fps_governor::start(
+        fps_governor::parse_mode(std::env::var("TTFX_BG_MAX_FPS").ok().as_deref()),
+        |line| log_dbg(&line),
+    );
     if args.iter().any(|a| a == "--render") {
         let effect = arg_value(&args, "--effect").unwrap_or_else(|| "matrix".into());
         let cols = arg_value(&args, "--cols")
@@ -3628,6 +3627,30 @@ struct AsmThemeSink<'a> {
     effect_name: &'a str,
     theme_watcher: ThemeWatcher,
     use_theme_colors: bool,
+    /// Paces the engine to the live frame-rate ceiling; see `pace_to_cap`.
+    next_due: Option<std::time::Instant>,
+}
+
+/// The assembly engine paces itself to the frame rate fixed when the run
+/// started. The ceiling can change while it runs (auto mode), so each emitted
+/// frame also waits for the live ceiling: the effective rate is the lower of
+/// the two. Returns the deadline for the next frame.
+fn pace_to_cap(
+    cap: Option<f64>,
+    next_due: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let cap = cap?;
+    let period = Duration::from_secs_f64(1.0 / cap.max(1.0));
+    let due = match next_due {
+        // Far behind (effect switch, pause): restart the cadence from now.
+        Some(due) if now.duration_since(due) < period * 2 => due,
+        _ => now,
+    };
+    if due > now {
+        thread::sleep(due - now);
+    }
+    Some(due + period)
 }
 
 unsafe extern "C" fn asm_emit_themed_frame(
@@ -3643,6 +3666,8 @@ unsafe extern "C" fn asm_emit_themed_frame(
     // SAFETY: the ASM callback is synchronous and its caller holds this stack
     // value exclusively until run_direct returns. It cannot escape to GTK.
     let themed = unsafe { &mut *(ctx as *mut AsmThemeSink<'_>) };
+    fps_governor::note_tick();
+    themed.next_due = pace_to_cap(max_fps(), themed.next_due, std::time::Instant::now());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         asm_emit_themed_frame_inner(themed, cols, rows, grid, pool)
     })) {
@@ -3708,9 +3733,8 @@ fn run_ttfx_asm_direct(
     let config = TerminalConfig {
         canvas_width: cols as i64,
         canvas_height: rows as i64,
-        frame_rate: (60.0 * speed_multiplier(cfg.speed))
-            .round()
-            .clamp(1.0, max_fps().unwrap_or(60.0).min(60.0)) as i64,
+        // The live ceiling is applied per frame in `pace_to_cap`.
+        frame_rate: (60.0 * speed_multiplier(cfg.speed)).round().clamp(1.0, 60.0) as i64,
         ignore_terminal_dimensions: true,
         ..TerminalConfig::default()
     };
@@ -3735,6 +3759,7 @@ fn run_ttfx_asm_direct(
         effect_name,
         theme_watcher: ThemeWatcher::new(),
         use_theme_colors: cfg.use_theme_colors,
+        next_due: None,
     };
     while !themed.sink.stop.load(Ordering::Relaxed) {
         let hook = DirectFrameHook {
@@ -5026,6 +5051,37 @@ mod audio_lifecycle_tests {
         assert!(!capture.capture_orphaned());
         drop(renderer);
         assert!(capture.capture_orphaned());
+    }
+}
+
+#[cfg(test)]
+mod pace_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn without_a_ceiling_nothing_is_scheduled() {
+        assert!(pace_to_cap(None, None, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn frames_are_spaced_one_period_apart() {
+        let t0 = Instant::now();
+        let due1 = pace_to_cap(Some(50.0), None, t0).unwrap();
+        assert_eq!(due1 - t0, Duration::from_millis(20));
+        let t1 = t0 + Duration::from_millis(5);
+        let started = Instant::now();
+        let due2 = pace_to_cap(Some(50.0), Some(due1), t1).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(10), "waited for the deadline");
+        assert_eq!(due2 - t0, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn a_long_gap_restarts_the_cadence() {
+        let t0 = Instant::now();
+        let late = t0 + Duration::from_secs(1);
+        let due = pace_to_cap(Some(50.0), Some(t0), late).unwrap();
+        assert_eq!(due - late, Duration::from_millis(20));
     }
 }
 
