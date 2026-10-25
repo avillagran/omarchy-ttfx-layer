@@ -22,6 +22,7 @@ mod direct_glyph_atlas;
 mod frame_cadence;
 mod frame_handoff;
 mod fps_governor;
+mod standalone;
 mod frame_wakeup;
 mod gpu_grid;
 mod occlusion;
@@ -928,6 +929,10 @@ fn main() -> Result<()> {
         log_dbg(message);
         #[cfg(not(feature = "vte"))]
         std::process::exit(2);
+    }
+    // omarchy-bg-live's `ttfx` source: one output, no plugin state or lock.
+    if standalone::invoked_as_standalone(&args[0]) || args.iter().any(|a| a == "--standalone") {
+        return standalone::run(&args);
     }
     fps_governor::start(
         fps_governor::parse_mode(std::env::var("TTFX_BG_MAX_FPS").ok().as_deref()),
@@ -1956,6 +1961,8 @@ fn spawn_gpu_wayland_layer_for_monitor(
     let spec = wl_layer::LayerSpec {
         output: monitor.connector().map(|c| c.to_string()),
         namespace: "ttfx-bg-gpu".into(),
+        overlay: false,
+        keyboard_exclusive: false,
         cols,
         rows,
         cell_px,

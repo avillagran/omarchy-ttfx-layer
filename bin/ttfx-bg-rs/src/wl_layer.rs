@@ -300,6 +300,10 @@ pub fn available() -> bool {
 pub struct LayerSpec {
     pub output: Option<String>,
     pub namespace: String,
+    /// Overlay (screensaver) instead of bottom (background).
+    pub overlay: bool,
+    /// Take the keyboard so keys never reach the window underneath.
+    pub keyboard_exclusive: bool,
     pub cols: usize,
     pub rows: usize,
     pub cell_px: f64,
@@ -352,10 +356,20 @@ pub fn run(
 
     let surface = compositor.create_surface(&qh, ());
     let layer = layer_shell.get_layer_surface(
-        &surface, output.as_ref(), zwlr_layer_shell_v1::Layer::Bottom, spec.namespace.clone(), &qh, ());
+        &surface,
+        output.as_ref(),
+        if spec.overlay { zwlr_layer_shell_v1::Layer::Overlay } else { zwlr_layer_shell_v1::Layer::Bottom },
+        spec.namespace.clone(),
+        &qh,
+        (),
+    );
     layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
     layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer.set_keyboard_interactivity(if spec.keyboard_exclusive {
+        KeyboardInteractivity::Exclusive
+    } else {
+        KeyboardInteractivity::None
+    });
     // A background takes no pointer input.
     let empty = compositor.create_region(&qh, ());
     surface.set_input_region(Some(&empty));

@@ -83,10 +83,30 @@ On x86_64 the build needs NASM 3.0 or newer (`pacman -S nasm`); without it the e
 
 Runtime knobs (set in `bin/ttfx-bg-launch.sh`): `TTFX_BG_MAX_FPS` (`auto` by default: 20-60 fps chosen from the measured CPU cost per frame against `TTFX_BG_CPU_BUDGET`, default 0.08 of one core; or a fixed number), `TTFX_BG_RENDERER` (`gpu`, `direct` or `vte`), `TTFX_BG_WL_DAMAGE` (`full`, `bbox`, `all` or a maximum number of damage rectangles; default 2) and `TTFX_BG_WL_STATS=1` to log per-second render statistics to `/tmp/ttfx-bg-debug.log`.
 
+## As a source for omarchy-bg-live
+
+The same binary runs on its own as `omarchy-ttfx-layer` (a symlink or copy
+with that name, or `--standalone`): one output, its own layer surface, no
+plugin state, no controller lock. omarchy-bg-live's `ttfx` source uses it to
+show these effects as the background or as the screensaver.
+
+```sh
+omarchy-ttfx-layer --output eDP-1 --layer overlay --keyboard exclusive \
+  --effects matrix,decrypt,rings --rotate 30 --fps auto
+```
+
+`--layer`, `--keyboard`, `--output`, the size and `--namespace` default to
+the `OMARCHY_BG_LIVE_*` variables omarchy-bg-live sets. `--probe` prints
+`omarchy-ttfx-layer 1` and exits, so callers can tell this build from older
+ones. With `--fps auto` the ceiling also respects `TTFX_BG_GPU_BUDGET`
+(default 0.30) where the kernel reports GPU load (Intel RC6, AMD
+`gpu_busy_percent`).
+
 ## Files
 
 - `bin/ttfx-bg-rs/src/main.rs` — state polling, renderer lifecycle, monitor tracking.
 - `bin/ttfx-bg-rs/src/wl_layer.rs`, `gpu_grid.rs`, `occlusion.rs` — Wayland layer surface, GPU cell grid renderer, pause when covered/locked/screen off.
+- `bin/ttfx-bg-rs/src/fps_governor.rs`, `standalone.rs` — automatic frame-rate ceiling; the `omarchy-ttfx-layer` mode.
 - `bin/ttfx-bg-rs/src/` + `ttfx-src/` — Rust source and vendored effect engine.
 - `BarWidget.qml` — bar icon.
 - `Panel.qml` — configuration panel.
