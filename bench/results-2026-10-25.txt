@@ -1,0 +1,25 @@
+procs: 0
+pgrep: pattern that searches for process name longer than 15 characters will result in zero matches
+Try `pgrep -f' option to match against the complete command line.
+== 2026-10-25T00:36:08-03:00 secs=60 policies
+matrix-min     ours  fps=30  total=  7.9% foot=  0.0% ttfx=  7.9% hypr=  7.0% gpu= 36.1% sys=  5.2% temp=61.3/65.0C fan=   0 freq=2372MHz
+matrix-full    ours  fps=30  total=  7.9% foot=  0.0% ttfx=  7.9% hypr=  6.8% gpu= 35.8% sys=  4.9% temp=63.0/67.0C fan=   0 freq=2445MHz
+matrix-bbox    ours  fps=30  total=  0.1% foot=  0.0% ttfx=  0.1% hypr= 30.3% gpu= 42.1% sys= 40.4% temp=76.2/82.0C fan=   0 freq=3037MHz
+== 2026-10-25T00:47:11-03:00 secs=45 gpu split
+m-normal       ours  fps=30  total=  8.4% foot=  0.0% ttfx=  8.4% hypr=  6.7% gpu= 35.8% sys=  5.1% temp=63.4/69.0C fan=   0 freq=2567MHz area=97.4% sent=1.9 clip=35.6 swap=319us
+m-nodraw       ours  fps=30  total=  6.9% foot=  0.0% ttfx=  6.9% hypr=  6.5% gpu= 27.7% sys=  4.6% temp=63.4/67.0C fan=   0 freq=2396MHz area=97.6% sent=1.9 clip=36.6 swap=89us
+m-fullclip     ours  fps=30  total=  8.4% foot=  0.0% ttfx=  8.4% hypr=  6.7% gpu= 37.1% sys=  5.2% temp=65.5/69.0C fan=   0 freq=2441MHz area=96.8% sent=1.9 clip=1.0 swap=293us
+m-normal-b     ours  fps=30  total=  8.4% foot=  0.0% ttfx=  8.4% hypr=  6.9% gpu= 35.8% sys=  5.1% temp=66.0/70.0C fan=   0 freq=2344MHz area=97.6% sent=1.9 clip=36.6 swap=316us
+m-nodraw-b     ours  fps=30  total=  6.8% foot=  0.0% ttfx=  6.8% hypr=  6.6% gpu= 27.8% sys=  4.7% temp=65.5/69.0C fan=   0 freq=2164MHz area=98.1% sent=1.9 clip=36.8 swap=85us
+== done 2026-10-25T00:53:31-03:00
+== 2026-10-25T00:53:53-03:00 secs=60 policy=2 fps sweep
+mix-p2-30      ours  fps=30  total=  6.3% foot=  0.0% ttfx=  6.3% hypr=  6.2% gpu= 29.8% sys=  4.4% temp=64.3/68.0C fan=   0 freq=2462MHz area=50.0% sent=1.5 clip=28.7 swap=321us
+mix-p2-24      ours  fps=24  total=  4.8% foot=  0.0% ttfx=  4.8% hypr=  4.8% gpu= 22.9% sys=  3.8% temp=63.3/65.0C fan=   0 freq=2730MHz area=45.1% sent=1.4 clip=22.9 swap=318us
+mix-p2-20      ours  fps=20  total=  3.7% foot=  0.0% ttfx=  3.7% hypr=  4.0% gpu= 18.4% sys=  2.9% temp=61.0/63.0C fan=   0 freq=2546MHz area=43.8% sent=1.4 clip=19.2 swap=369us
+mix-p2-15      ours  fps=15  total=  2.6% foot=  0.0% ttfx=  2.6% hypr=  2.8% gpu= 13.0% sys=  2.1% temp=59.0/60.0C fan=   0 freq=2262MHz area=37.5% sent=1.4 clip=13.3 swap=359us
+mix-p2-30      ours  fps=30  total=  6.2% foot=  0.0% ttfx=  6.2% hypr=  6.1% gpu= 29.7% sys=  4.4% temp=63.1/67.0C fan=   0 freq=2614MHz area=49.2% sent=1.5 clip=27.5 swap=320us
+mix-p2-24      ours  fps=24  total=  4.8% foot=  0.0% ttfx=  4.8% hypr=  4.9% gpu= 23.0% sys=  3.5% temp=62.4/66.0C fan=   0 freq=2366MHz area=45.7% sent=1.5 clip=23.5 swap=320us
+mix-p2-20      ours  fps=20  total=  3.7% foot=  0.0% ttfx=  3.7% hypr=  3.9% gpu= 18.4% sys=  2.8% temp=60.7/63.0C fan=   0 freq=2284MHz area=40.0% sent=1.4 clip=16.0 swap=365us
+mix-p2-15      ours  fps=15  total=  2.7% foot=  0.0% ttfx=  2.7% hypr=  2.8% gpu= 13.1% sys=  2.2% temp=58.9/62.0C fan=   0 freq=2268MHz area=37.9% sent=1.4 clip=14.3 swap=365us
+idle           idle  fps=-   total=  0.0% foot=  0.0% ttfx=  0.0% hypr=  0.0% gpu=  0.0% sys=  0.4% temp=53.2/55.0C fan=   0 freq=2183MHz
+== done 2026-10-25T01:08:32-03:00

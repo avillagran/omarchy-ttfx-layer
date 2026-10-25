@@ -1,0 +1,16 @@
+== 2026-10-24T17:12:18-03:00 secs=120
+idle           idle  fps=-   total=  0.0% foot=  0.0% ttfx=  0.0% hypr=  0.0% gpu=  0.0% sys=  0.3% temp=56.3/59.0C fan=1298 freq=2149MHz
+master-120     term  fps=120 total=133.0% foot=129.3% ttfx=  3.7% hypr= 30.0% gpu= 46.7% sys= 42.9% temp=79.8/89.0C fan=1298 freq=2982MHz
+pr61-120       term  fps=120 total=130.4% foot=126.6% ttfx=  3.9% hypr= 30.2% gpu= 45.3% sys= 42.2% temp=80.5/87.0C fan=1298 freq=2936MHz
+pr61-30        term  fps=30  total= 76.0% foot= 75.2% ttfx=  0.8% hypr= 35.9% gpu= 17.1% sys= 29.4% temp=69.4/72.0C fan=1299 freq=2796MHz
+master-30      term  fps=30  total= 89.9% foot= 88.5% ttfx=  1.3% hypr= 39.2% gpu= 19.4% sys= 34.1% temp=70.2/75.0C fan=1298 freq=2857MHz
+ours-30        ours  fps=30  total=  2.8% foot=  0.0% ttfx=  2.8% hypr=  2.1% gpu=  9.1% sys=  1.9% temp=60.2/64.0C fan=1298 freq=2400MHz
+ours-30        ours  fps=30  total=  2.8% foot=  0.0% ttfx=  2.8% hypr=  2.2% gpu=  9.1% sys=  1.9% temp=57.9/62.0C fan=1298 freq=2293MHz
+master-30      term  fps=30  total= 87.9% foot= 86.6% ttfx=  1.3% hypr= 39.5% gpu= 19.3% sys= 33.5% temp=66.6/73.0C fan=1298 freq=2817MHz
+pr61-30        term  fps=30  total= 77.6% foot= 76.8% ttfx=  0.8% hypr= 37.0% gpu= 17.4% sys= 30.1% temp=67.5/72.0C fan=1298 freq=2699MHz
+pr61-120       term  fps=120 total=130.1% foot=126.3% ttfx=  3.9% hypr= 30.5% gpu= 45.1% sys= 42.2% temp=79.1/86.0C fan=1298 freq=2927MHz
+master-120     term  fps=120 total=133.4% foot=129.7% ttfx=  3.7% hypr= 30.0% gpu= 46.8% sys= 42.9% temp=82.4/89.0C fan=1298 freq=2979MHz
+== done 2026-10-24T17:43:05-03:00
+ours-asm-30    ours  fps=30  total=  6.3% foot=  0.0% ttfx=  6.3% hypr=  6.8% gpu= 32.0% sys=  4.6% temp=68.5/73.0C fan=1298 freq=2443MHz
+ours-asm-30    ours  fps=30  total=  6.4% foot=  0.0% ttfx=  6.4% hypr=  6.8% gpu= 32.2% sys=  4.6% temp=66.9/72.0C fan=1298 freq=2447MHz
+ours-asm-30-r5 ours  fps=30  total=  4.0% foot=  0.0% ttfx=  4.0% hypr=  6.2% gpu= 31.9% sys=  3.8% temp=65.2/71.0C fan=1298 freq=2337MHz
