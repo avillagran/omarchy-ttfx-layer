@@ -204,6 +204,8 @@ fn emit_frame_inner(
     if sink.stop.load(Ordering::Relaxed) || (cols as usize, rows as usize) != sink.dimensions {
         return 1;
     }
+    // Hold the effect while its monitor is hidden; it resumes where it was.
+    crate::occlusion::wait_while_hidden(&sink.stop);
     // SAFETY: emit_frame's borrowed frame contract guarantees valid pointers.
     if let Err(error) = unsafe { decode_frame(cols, rows, grid, pool, &mut sink.decoded) } {
         sink.error = Some(error);

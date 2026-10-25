@@ -22,6 +22,9 @@ mod direct_glyph_atlas;
 mod frame_cadence;
 mod frame_handoff;
 mod frame_wakeup;
+mod gpu_grid;
+mod occlusion;
+mod wl_layer;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;
@@ -189,11 +192,29 @@ fn speed_delay(baseline: Duration, speed: i64) -> Duration {
 const MIN_RENDER_FRAME: Duration = Duration::from_micros(16_667);
 
 fn render_frame_interval(intended: Duration, direct: bool) -> Duration {
-    if direct {
+    let interval = if direct {
         intended
     } else {
         intended.max(MIN_RENDER_FRAME)
+    };
+    match max_fps() {
+        Some(fps) => interval.max(Duration::from_secs_f64(1.0 / fps)),
+        None => interval,
     }
+}
+
+// Optional user ceiling (TTFX_BG_MAX_FPS). Old machines run hot at 60fps; the
+// effect speed setting still controls animation timing below the ceiling.
+fn max_fps() -> Option<f64> {
+    static MAX_FPS: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *MAX_FPS.get_or_init(|| parse_max_fps(std::env::var("TTFX_BG_MAX_FPS").ok().as_deref()))
+}
+
+fn parse_max_fps(value: Option<&str>) -> Option<f64> {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|fps| fps.is_finite() && *fps >= 1.0)
+        .map(|fps| fps.min(240.0))
 }
 
 // --- Auto-degrade: detect sustained FPS drops and coarsen the grid -------------
@@ -392,11 +413,13 @@ const DEFAULT_BYLINE: &str = "By x.com/avillagran";
 enum RenderBackend {
     Vte,
     Direct,
+    Gpu,
 }
 
 fn render_backend_from_value(value: Option<&str>) -> RenderBackend {
     match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("direct") => RenderBackend::Direct,
+        Some("gpu") => RenderBackend::Gpu,
         _ => RenderBackend::Vte,
     }
 }
@@ -1044,10 +1067,11 @@ fn main() -> Result<()> {
         let rebuilding: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         monitors.connect_items_changed(move |_, _pos, _removed, _added| {
             let sig = monitor_signature();
-            if sig == *last_sig.borrow() {
+            let previous = last_sig.replace(sig.clone());
+            if sig == previous {
                 return;
             }
-            *last_sig.borrow_mut() = sig;
+            log_dbg(&format!("monitors changed: {previous} -> {sig}"));
             if *rebuilding.borrow() {
                 return;
             }
@@ -1059,7 +1083,7 @@ fn main() -> Result<()> {
             let ae = ae.clone();
             let rebuilding = rebuilding.clone();
             glib::timeout_add_local_once(Duration::from_millis(250), move || {
-                println!("monitors changed — rebuilding background layers");
+                log_dbg("monitors changed: rebuilding background layers");
                 let cfg = read_config();
                 *lc.borrow_mut() = cfg.clone();
                 rebuild_layers(&w, &b, &cfg, &ae.borrow(), true);
@@ -1212,7 +1236,7 @@ fn log_dbg(msg: &str) {
     let h = ts / 3600;
     let m = (ts % 3600) / 60;
     let s = ts % 60;
-    let line = format!("[{h:02}:{m:02}:{s:02}] {msg}\n");
+    let line = format!("[{h:02}:{m:02}:{s:02} {}] {msg}\n", std::process::id());
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1220,6 +1244,8 @@ fn log_dbg(msg: &str) {
         .and_then(|mut f| f.write_all(line.as_bytes()));
     eprintln!("{msg}");
 }
+
+const LAYER_STOP_KEY: &str = "ttfx-layer-stop";
 
 fn rebuild_layers(
     windows: &Rc<RefCell<Vec<gtk4::ApplicationWindow>>>,
@@ -1236,6 +1262,11 @@ fn rebuild_layers(
         .args(["-TERM", "-P", &std::process::id().to_string()])
         .output();
     for w in windows.borrow_mut().drain(..) {
+        // Windows that were never shown (the Wayland GPU layer's handle) get no
+        // close-request, so stop their renderer explicitly.
+        if let Some(stop) = unsafe { w.data::<Arc<std::sync::atomic::AtomicBool>>(LAYER_STOP_KEY) } {
+            unsafe { stop.as_ref() }.store(true, Ordering::Release);
+        }
         w.close();
     }
     // Toggled off: leave NO layer window at all. The desktop then shows the
@@ -1270,9 +1301,26 @@ fn spawn_layer_for_monitor(
     effect: &str,
     show_intro: bool,
 ) -> gtk4::ApplicationWindow {
-    if render_backend() == RenderBackend::Direct {
-        return spawn_direct_layer_for_monitor(monitor, cfg, effect, show_intro);
+    match render_backend() {
+        RenderBackend::Direct => return spawn_direct_layer_for_monitor(monitor, cfg, effect, show_intro),
+        RenderBackend::Gpu if wl_layer::available() => {
+            return spawn_gpu_wayland_layer_for_monitor(monitor, cfg, effect, show_intro)
+        }
+        RenderBackend::Gpu => {
+            log_dbg("gpu renderer unavailable (EGL/GLES 3); using the direct renderer");
+            return spawn_direct_layer_for_monitor(monitor, cfg, effect, show_intro);
+        }
+        RenderBackend::Vte => spawn_vte_layer_for_monitor(monitor, self_bin, cfg, effect, show_intro),
     }
+}
+
+fn spawn_vte_layer_for_monitor(
+    monitor: &gdk::Monitor,
+    self_bin: &str,
+    cfg: &Config,
+    effect: &str,
+    show_intro: bool,
+) -> gtk4::ApplicationWindow {
     let window = gtk4::ApplicationWindow::builder().title("ttfx-bg").build();
 
     window.init_layer_shell();
@@ -1799,9 +1847,12 @@ fn spawn_direct_layer_for_monitor(
     let effect = effect.to_string();
     let render_effect = effect.clone();
     let render_stop = stop.clone();
+    occlusion::start();
+    let render_monitor = monitor.connector().map(|c| c.to_string());
     thread::Builder::new()
         .name(format!("ttfx-direct-{effect}"))
         .spawn(move || {
+            occlusion::set_current(render_monitor);
             frame_wakeup::set_current(publication_wakeup);
             frame_cadence::set_current(cadence);
             let failure_stop = render_stop.clone();
@@ -1834,6 +1885,102 @@ fn spawn_direct_layer_for_monitor(
     ));
     log_dbg(&format!("direct renderer spawned: {effect} {cols}x{rows}"));
     window.present();
+    window
+}
+
+// GPU backend: the effect runs on the same producer thread as the direct
+// backend, but the background surface is our own Wayland layer drawn with GLES
+// (see wl_layer.rs), so each frame reports only the changed rectangles to the
+// compositor. GTK keeps an unmapped window as the handle rebuild_layers closes.
+fn spawn_gpu_wayland_layer_for_monitor(
+    monitor: &gdk::Monitor,
+    cfg: &Config,
+    effect: &str,
+    show_intro: bool,
+) -> gtk4::ApplicationWindow {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Mutex;
+
+    let window = gtk4::ApplicationWindow::builder().title("ttfx-bg-wayland").build();
+    let geo = monitor.geometry();
+    let scale = monitor.scale_factor().max(1) as f64;
+    let cell_px = (9.0 / scale * cfg.resolution.clamp(1, 8) as f64).max(3.0);
+    let font = gtk4::gdk::pango::FontDescription::from_string(&format!("monospace {cell_px:.0}px"));
+    let font_size = font.size() as f64 / gtk4::pango::SCALE as f64;
+    let metrics = window.pango_context().metrics(Some(&font), None);
+    let char_w = metrics.approximate_char_width() as f64 / gtk4::pango::SCALE as f64;
+    let ascent = metrics.ascent() as f64 / gtk4::pango::SCALE as f64;
+    let descent = metrics.descent() as f64 / gtk4::pango::SCALE as f64;
+    let cw = if char_w > 0.0 { char_w } else { font_size * 0.6 };
+    let ch = if ascent + descent > 0.0 { ascent + descent } else { font_size * 1.2 };
+    let (cols, rows) = measured_grid(geo.width(), geo.height(), cw, ch);
+    let cell_aspect = if cw > 0.0 { (ch / cw) as f32 } else { 2.0 };
+
+    let snapshot = Arc::new(Mutex::new(Vec::<DirectCell>::new()));
+    let generation = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let wakeup = match frame_wakeup::FrameWakeup::new(stop.clone()) {
+        Ok(wakeup) => Arc::new(wakeup),
+        Err(error) => {
+            log_dbg(&format!("gpu layer: wakeup unavailable ({error}); using the direct renderer"));
+            return spawn_direct_layer_for_monitor(monitor, cfg, effect, show_intro);
+        }
+    };
+
+    let spec = wl_layer::LayerSpec {
+        output: monitor.connector().map(|c| c.to_string()),
+        namespace: "ttfx-bg-gpu".into(),
+        cols,
+        rows,
+        cell_px,
+        opaque: !cfg.transparent_background,
+        show_fps: cfg.show_fps,
+    };
+    {
+        let snapshot = snapshot.clone();
+        let generation = generation.clone();
+        let stop = stop.clone();
+        let wakeup = wakeup.clone();
+        thread::Builder::new()
+            .name("ttfx-wayland".into())
+            .spawn(move || {
+                if let Err(error) = wl_layer::run(spec, snapshot, generation, stop.clone(), wakeup) {
+                    log_dbg(&format!("wayland layer error: {error:#}"));
+                }
+                stop.store(true, Ordering::Release);
+            })
+            .expect("spawn wayland layer");
+    }
+
+    let cfg = cfg.clone();
+    let render_effect = effect.to_string();
+    let render_stop = stop.clone();
+    occlusion::start();
+    let render_monitor = monitor.connector().map(|c| c.to_string());
+    thread::Builder::new()
+        .name(format!("ttfx-gpu-{effect}"))
+        .spawn(move || {
+            occlusion::set_current(render_monitor);
+            frame_wakeup::set_current(Some(wakeup));
+            let failure_stop = render_stop.clone();
+            if let Err(error) = run_direct_render(
+                &cfg, &render_effect, cols, rows, show_intro, cell_aspect,
+                snapshot, generation, render_stop,
+            ) {
+                log_dbg(&format!("gpu renderer error: {error:?}"));
+                failure_stop.store(true, Ordering::Relaxed);
+            }
+            frame_wakeup::set_current(None);
+        })
+        .expect("spawn gpu renderer");
+    unsafe { window.set_data(LAYER_STOP_KEY, stop.clone()) };
+    let close_stop = stop.clone();
+    window.connect_close_request(move |_| {
+        close_stop.store(true, Ordering::Release);
+        gtk4::glib::Propagation::Proceed
+    });
+    window.connect_destroy(move |_| stop.store(true, Ordering::Release));
+    log_dbg(&format!("gpu wayland renderer spawned: {effect} {cols}x{rows} max_fps={:?}", max_fps()));
     window
 }
 
@@ -2297,6 +2444,9 @@ impl Screen {
         }
     }
     fn present(&mut self) {
+        if let Some(stop) = &self.stop_flag {
+            occlusion::wait_while_hidden(stop);
+        }
         if let (Some(slot), Some(gen), Some(cells)) = (
             &self.direct_snapshot,
             &self.snapshot_gen,
@@ -3533,7 +3683,7 @@ fn run_ttfx_asm_direct(
         canvas_height: rows as i64,
         frame_rate: (60.0 * speed_multiplier(cfg.speed))
             .round()
-            .clamp(1.0, 60.0) as i64,
+            .clamp(1.0, max_fps().unwrap_or(60.0).min(60.0)) as i64,
         ignore_terminal_dimensions: true,
         ..TerminalConfig::default()
     };
