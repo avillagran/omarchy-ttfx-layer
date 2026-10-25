@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+#[cfg(feature = "vte")]
 use vte4::{TerminalExt, TerminalExtManual};
 
 // Thread-local palette shared between the watcher (run_render) and the effects
@@ -924,6 +925,15 @@ fn main() -> Result<()> {
         println!("{new}");
         return Ok(());
     }
+    // Without the assembly engine every effect fails at spawn time. Say so
+    // once here instead of leaving a blank layer and an error buried in the log.
+    if cfg!(target_arch = "x86_64") && ttfx::asm::tier() == 0 {
+        let message = "ttfx-bg-rs: built without the ttfx assembly engine (NASM was missing); effects cannot render";
+        eprintln!("{message}");
+        log_dbg(message);
+        #[cfg(not(feature = "vte"))]
+        std::process::exit(2);
+    }
     if args.iter().any(|a| a == "--render") {
         let effect = arg_value(&args, "--effect").unwrap_or_else(|| "matrix".into());
         let cols = arg_value(&args, "--cols")
@@ -1314,6 +1324,23 @@ fn spawn_layer_for_monitor(
     }
 }
 
+// Builds without the `vte` feature do not link libvte, which a fresh Omarchy
+// does not install. They fall back to the GPU layer, then the direct renderer.
+#[cfg(not(feature = "vte"))]
+fn spawn_vte_layer_for_monitor(
+    monitor: &gdk::Monitor,
+    _self_bin: &str,
+    cfg: &Config,
+    effect: &str,
+    show_intro: bool,
+) -> gtk4::ApplicationWindow {
+    if wl_layer::available() {
+        return spawn_gpu_wayland_layer_for_monitor(monitor, cfg, effect, show_intro);
+    }
+    spawn_direct_layer_for_monitor(monitor, cfg, effect, show_intro)
+}
+
+#[cfg(feature = "vte")]
 fn spawn_vte_layer_for_monitor(
     monitor: &gdk::Monitor,
     self_bin: &str,
