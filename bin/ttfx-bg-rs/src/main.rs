@@ -4492,6 +4492,16 @@ fn fx_matrix(
     effect: &str,
 ) -> Result<()> {
     use rand::Rng;
+    let mut native_probe = if scr.direct_snapshot.is_some() {
+        producer_probe::ProducerProbe::open()?
+    } else { None };
+    if let Some(probe) = native_probe.as_mut() {
+        probe.record(serde_json::json!({"event":"producer_route", "route":"native_matrix",
+            "effect":effect, "uses_asm":false, "rng":"rand::thread_rng", "seed_controlled":false,
+            "asm_seed_ignored":std::env::var_os("TTFX_BG_CADENCE_SEED").is_some(),
+            "asm_timing_ignored":std::env::var("TTFX_ASM_TIMING").as_deref()==Ok("1"),
+            "cols":scr.cols, "rows":scr.rows, "base_delay_ms":40}));
+    }
     let mut rng = rand::thread_rng();
     let chars: Vec<char> = if rain {
         "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿ0123456789".chars().collect()
@@ -4519,6 +4529,9 @@ fn fx_matrix(
     let mut col_pal: Vec<Vec<String>> = (0..cols).map(|_| palette.to_vec()).collect();
     let mut theme_watcher = ThemeWatcher::new();
     loop {
+        let diagnostic_begin = native_probe.as_ref().map(|_| {
+            (producer_probe::monotonic_ns(), producer_probe::thread_cpu_ns())
+        });
         if scr.maybe_resize() {
             return Ok(());
         }
@@ -4597,13 +4610,31 @@ fn fx_matrix(
                 }
             }
         }
-        let frame_dur = render_frame_interval(
-            frame_delay(40, live_intensity(intensity), live_speed(5), audio),
-            scr.direct_snapshot.is_some(),
-        );
+        let effective_intensity = live_intensity(intensity);
+        let effective_speed = live_speed(5);
+        let intended = frame_delay(40, effective_intensity, effective_speed, audio);
+        let frame_dur = render_frame_interval(intended, scr.direct_snapshot.is_some());
+        let audio_volume_sample = native_probe.as_ref().map(|_| audio.volume());
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
+        let before_present = native_probe.as_ref().map(|_| producer_probe::monotonic_ns());
         scr.present();
+        let sleep_enter = native_probe.as_ref().map(|_| producer_probe::monotonic_ns());
         thread::sleep(frame_dur);
+        if let (Some(probe), Some((begin, cpu_begin)), Some(before), Some(sleep_begin)) =
+            (native_probe.as_mut(), diagnostic_begin, before_present, sleep_enter) {
+            let sleep_end = producer_probe::monotonic_ns();
+            probe.sequence += 1;
+            probe.record(serde_json::json!({"event":"native_matrix_frame", "route":"native_matrix",
+                "sequence":probe.sequence, "frame_begin_ns":begin, "frame_cpu_begin_ns":cpu_begin,
+                "effective_intensity":effective_intensity, "effective_speed":effective_speed,
+                "audio_volume_sample":audio_volume_sample, "cap":max_fps(),
+                "intended_delay_ns":intended.as_nanos() as u64,
+                "sleep_requested_ns":frame_dur.as_nanos() as u64,
+                "compute_ns":before-begin, "present_ns":sleep_begin-before,
+                "sleep_enter_ns":sleep_begin, "sleep_end_ns":sleep_end,
+                "sleep_elapsed_ns":sleep_end-sleep_begin,
+                "generation":scr.snapshot_gen.as_ref().map(|g|g.load(std::sync::atomic::Ordering::Acquire))}));
+        }
     }
 }
 
@@ -6100,5 +6131,63 @@ mod live_reactivity_tests {
         audio.reactivity.checked.set(std::time::Instant::now());
         assert_eq!(asm_audio_poll(ctx),0);
         assert_eq!(asm_audio_params(ctx,out.as_mut_ptr()),0);
+    }
+}
+
+#[cfg(test)]
+mod native_matrix_diagnostic_tests {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    fn matrix_route_and_default_sleep_are_native_and_25ms() {
+        assert!(!is_ttfx_effect("matrix"));
+        assert!(!is_ttfx_effect("rain"));
+        let audio = AudioState::start(false);
+        assert_eq!(frame_delay(40, 5, 5, &audio), Duration::from_millis(25));
+    }
+    #[test]
+    #[ignore = "helper aislado invocado por native_matrix_produces_diagnostic_log"]
+    fn native_probe_child() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicU64, AtomicBool, Ordering}};
+        let generation = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(Mutex::new(Vec::new()));
+        let (g,s) = (generation.clone(),stop.clone());
+        let worker = std::thread::spawn(move || {
+            INTENSITY_WATCHER.with(|w| *w.borrow_mut()=IntensityWatcher {last_check:Instant::now(),intensity:5});
+            SPEED_WATCHER.with(|w| *w.borrow_mut()=SpeedWatcher {last_check:Instant::now(),speed:5});
+            let cfg=Config {audio:false,use_theme_colors:false,..Config::default()};
+            run_direct_render(&cfg,"matrix",80,24,false,2.,slot,g,s)
+        });
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while generation.load(Ordering::Acquire)<3 && Instant::now()<deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stop.store(true,Ordering::Release);
+        worker.join().unwrap().unwrap();
+        assert!(generation.load(Ordering::Acquire)>=3);
+    }
+    #[test]
+    fn native_matrix_produces_diagnostic_log() {
+        let dir=std::env::temp_dir().join(format!("native-matrix-probe-{}-{}",std::process::id(),producer_probe::monotonic_ns()));
+        std::fs::create_dir(&dir).unwrap();
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","native_matrix_diagnostic_tests::native_probe_child","--ignored"])
+            .env("TTFX_BG_PRODUCER_LOG",dir.join("trace"))
+            .env("TTFX_BG_CADENCE_SEED","12345").env("TTFX_ASM_TIMING","1")
+            .status().unwrap();
+        assert!(status.success());
+        let file=std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let events:Vec<serde_json::Value>=std::fs::read_to_string(file).unwrap().lines()
+            .map(|l|serde_json::from_str(l).unwrap()).collect();
+        assert!(events.iter().any(|e| e["event"]=="producer_route" && e["route"]=="native_matrix" && e["seed_controlled"]==false && e["asm_seed_ignored"]==true));
+        let frames:Vec<_>=events.iter().filter(|e|e["event"]=="native_matrix_frame").collect();
+        assert!(frames.len()>=3);
+        for e in frames {
+            assert_eq!(e["sleep_requested_ns"],25_000_000_u64);
+            assert!(e["sleep_elapsed_ns"].as_u64().unwrap()>=25_000_000);
+            assert!(e["generation"].as_u64().unwrap()>0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
