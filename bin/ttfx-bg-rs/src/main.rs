@@ -30,6 +30,7 @@ mod wl_layer;
 mod presentation_probe;
 mod producer_probe;
 mod native_publication;
+mod native_palette;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;
@@ -2280,6 +2281,7 @@ struct Screen {
     // allocations across frames instead of allocating a fresh publish Vec.
     direct_cells: Option<Vec<DirectCell>>,
     native_swap: bool,
+    native_sgr_cache: bool,
     // Direct catalog frames decode SGR once per run, then retain typed RGB at
     // the cell. Native effects still use their existing ANSI-string storage.
     direct_colors: Option<Vec<Vec<Option<(u8, u8, u8)>>>>,
@@ -2308,6 +2310,7 @@ impl Screen {
             direct_snapshot: None,
             direct_cells: None,
             native_swap: false,
+            native_sgr_cache: false,
             direct_colors: None,
             occupied: None,
             snapshot_gen: None,
@@ -2342,6 +2345,7 @@ impl Screen {
         scr.direct_snapshot = Some(snapshot);
         scr.direct_cells = Some(Vec::new());
         scr.native_swap = std::env::var("TTFX_BG_NATIVE_SWAP").as_deref()==Ok("1");
+        scr.native_sgr_cache = std::env::var("TTFX_BG_NATIVE_SGR_CACHE").as_deref()==Ok("1");
         scr.direct_colors = Some(vec![vec![None; cols]; rows]);
         scr.occupied = Some(DirectOccupancy::new(cols, rows));
         scr.snapshot_gen = Some(gen);
@@ -2366,6 +2370,7 @@ impl Screen {
             direct_snapshot: None,
             direct_cells: None,
             native_swap: false,
+            native_sgr_cache: false,
             direct_colors: None,
             occupied: None,
             snapshot_gen: None,
@@ -4520,7 +4525,7 @@ fn fx_matrix_with_rng<R: rand::Rng + ?Sized>(
     if let Some(probe) = native_probe.as_mut() {
         probe.record(serde_json::json!({"event":"producer_route", "route":"native_matrix",
             "effect":effect, "uses_asm":false, "rng":if native_seed.is_some(){"StdRng"}else{"rand::thread_rng"}, "seed_controlled":native_seed.is_some(), "native_seed":native_seed,
-            "native_swap":scr.native_swap,
+            "native_swap":scr.native_swap, "native_sgr_cache":scr.native_sgr_cache,
             "asm_seed_ignored":std::env::var_os("TTFX_BG_CADENCE_SEED").is_some(),
             "asm_timing_ignored":std::env::var("TTFX_ASM_TIMING").as_deref()==Ok("1"),
             "cols":scr.cols, "rows":scr.rows, "base_delay_ms":40}));
@@ -4549,6 +4554,8 @@ fn fx_matrix_with_rng<R: rand::Rng + ?Sized>(
     // so every cell always has a real hue (never the white default foreground).
     let mut cur_pal: Vec<String> = palette.to_vec();
     let mut col_pal: Vec<Vec<String>> = (0..cols).map(|_| palette.to_vec()).collect();
+    let mut current_rgb = scr.native_sgr_cache.then(||native_palette::resolve(palette));
+    let mut column_rgb = current_rgb.as_ref().map(|rgb|vec![rgb.clone();cols]);
     let mut theme_watcher = ThemeWatcher::new();
     loop {
         let diagnostic_begin = native_probe.as_ref().map(|_| {
@@ -4561,6 +4568,7 @@ fn fx_matrix_with_rng<R: rand::Rng + ?Sized>(
         if use_theme_colors {
             if let Some(new_colors) = theme_watcher.changed() {
                 cur_pal = theme_palette(new_colors, effect);
+                if let Some(rgb)=current_rgb.as_mut() { *rgb=native_palette::resolve(&cur_pal); }
                 set_theme_palette(cur_pal.clone());
                 log_dbg(&format!(
                     "theme colors changed: {effect} palette updated ({})",
@@ -4610,12 +4618,16 @@ fn fx_matrix_with_rng<R: rand::Rng + ?Sized>(
                     };
                     let idx = idx.min(pal.len().saturating_sub(1));
                     // fall back to a neutral theme hue if palette is empty
-                    let color = pal
-                        .get(idx)
-                        .cloned()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "\x1b[32m".to_string());
-                    scr.put(c, y as usize, ch, color);
+                    if let Some(columns)=column_rgb.as_ref() {
+                        scr.put_direct_rgb(c,y as usize,ch,columns[c][idx]);
+                    } else {
+                        let color = pal
+                            .get(idx)
+                            .cloned()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "\x1b[32m".to_string());
+                        scr.put(c, y as usize, ch, color);
+                    }
                 }
             }
             // Advance drop; on respawn adopt the current theme palette.
@@ -4627,6 +4639,9 @@ fn fx_matrix_with_rng<R: rand::Rng + ?Sized>(
                     speed[c] = rng.gen_range(speed_base..speed_base + 2).max(1);
                     trail[c] = rng.gen_range(trail_base..trail_base + 12);
                     col_pal[c] = cur_pal.clone();
+                    if let (Some(columns),Some(current))=(column_rgb.as_mut(),current_rgb.as_ref()) {
+                        columns[c].clone_from(current);
+                    }
                 } else {
                     head[c] = -(rows as i32 + 10);
                 }
@@ -6226,6 +6241,7 @@ mod native_swap_equivalence_tests {
             let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut screen=Screen::new_direct(237,61,slot,generation.clone(),stop);
             screen.native_swap=swap;
+            screen.native_sgr_cache=false;
             INTENSITY_WATCHER.with(|w| *w.borrow_mut()=IntensityWatcher {last_check:std::time::Instant::now()+Duration::from_secs(60),intensity:5});
             SPEED_WATCHER.with(|w| *w.borrow_mut()=SpeedWatcher {last_check:std::time::Instant::now()+Duration::from_secs(60),speed:5});
             native_publication::capture_begin(24);
@@ -6240,5 +6256,58 @@ mod native_swap_equivalence_tests {
         assert_eq!(a,b); // Campos, orden, caracteres, RGB, ocupación y número de pasos.
         assert_eq!(a.len(),24);
         assert!(a.windows(2).any(|w|w[0]!=w[1]));
+    }
+}
+
+#[cfg(test)]
+mod native_sgr_cache_equivalence_tests {
+    use super::*;
+    use rand::SeedableRng;
+    #[test]
+    fn seeded_matrix_and_rain_frames_match_with_typed_palette_and_swap_off() {
+        fn run(cache:bool,rain:bool,palette:&[String])->Vec<Vec<DirectCell>> {
+            let slot=Arc::new(std::sync::Mutex::new(Vec::new()));
+            let generation=Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut screen=Screen::new_direct(80,24,slot,generation.clone(),stop);
+            screen.native_swap=false; screen.native_sgr_cache=cache;
+            INTENSITY_WATCHER.with(|w| *w.borrow_mut()=IntensityWatcher {last_check:std::time::Instant::now()+Duration::from_secs(60),intensity:5});
+            SPEED_WATCHER.with(|w| *w.borrow_mut()=SpeedWatcher {last_check:std::time::Instant::now()+Duration::from_secs(60),speed:5});
+            native_publication::capture_begin(32);
+            let mut rng=rand::rngs::StdRng::seed_from_u64(12345);
+            let audio=AudioState::start(false);
+            fx_matrix_with_rng(&mut screen,palette,5,&audio,rain,false,if rain{"rain"}else{"matrix"},&mut rng,Some(12345)).unwrap();
+            assert_eq!(generation.load(Ordering::Acquire),32);
+            native_publication::capture_finish()
+        }
+        for rain in [false,true] {
+            for palette in [hardcoded_palette("matrix"),vec![],vec!["".into(),"\x1b[38;2;1;2;3m".into(),"\x1b[0m".into()]] {
+                assert_eq!(run(false,rain,&palette),run(true,rain,&palette));
+            }
+        }
+    }
+    #[test]
+    fn typed_palette_matches_theme_retention_clear_and_invalid_colors() {
+        fn run(cache:bool)->Vec<Vec<DirectCell>> {
+            let slot=Arc::new(std::sync::Mutex::new(Vec::new()));
+            let generation=Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut screen=Screen::new_direct(4,2,slot.clone(),generation,Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            screen.native_swap=false;
+            let mut frames=vec![];
+            for palette in [vec!["\x1b[31m","\x1b[38;5;42m"],vec!["\x1b[38;2;2;3;4m",""],vec!["broken","\x1b[0m"]] {
+                let palette:Vec<String>=palette.into_iter().map(str::to_string).collect();
+                let rgb=native_palette::resolve(&palette);
+                for (x,ch) in [(0,'A'),(1,'界'),(2,' ')] {
+                    let i=x%palette.len();
+                    if cache {screen.put_direct_rgb(x,0,ch,rgb[i]);}
+                    else {screen.put(x,0,ch,if palette[i].is_empty(){"\x1b[32m".into()}else{palette[i].clone()});}
+                }
+                screen.present();frames.push(slot.lock().unwrap().clone());
+                screen.erase(0,0); screen.present(); frames.push(slot.lock().unwrap().clone());
+                screen.clear_dirty();screen.present();frames.push(slot.lock().unwrap().clone());
+            }
+            frames
+        }
+        assert_eq!(run(false),run(true));
     }
 }
