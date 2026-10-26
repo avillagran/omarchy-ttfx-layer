@@ -27,6 +27,7 @@ mod frame_wakeup;
 mod gpu_grid;
 mod occlusion;
 mod wl_layer;
+mod presentation_probe;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;

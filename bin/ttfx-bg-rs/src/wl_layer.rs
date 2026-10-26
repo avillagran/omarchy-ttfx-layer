@@ -29,6 +29,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use crate::asm_direct_bridge::DirectCell;
 use crate::frame_handoff;
+use crate::presentation_probe::Probe;
+use serde_json::json;
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation::{self, WpPresentation},
+    wp_presentation_feedback::{self, WpPresentationFeedback},
+};
 use crate::frame_wakeup::FrameWakeup;
 use crate::gpu_grid::{GpuGrid, GpuPipeline};
 
@@ -230,6 +236,38 @@ struct State {
     configured: bool,
     closed: bool,
     frame_pending: bool,
+    probe: Option<Probe>,
+}
+
+// El timestamp viene del compositor; no se confunde con callback ni swap.
+impl Dispatch<WpPresentation, ()> for State {
+    fn event(state: &mut Self, _: &WpPresentation, event: wp_presentation::Event,
+             _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            if let Some(p) = state.probe.as_mut() { p.record(json!({"event":"clock", "clock_id":clk_id})); }
+        }
+    }
+}
+impl Dispatch<WpPresentationFeedback, u64> for State {
+    fn event(state: &mut Self, _: &WpPresentationFeedback, event: wp_presentation_feedback::Event,
+             id: &u64, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(p) = state.probe.as_mut() else { return };
+        match event {
+            wp_presentation_feedback::Event::Presented { tv_sec_hi, tv_sec_lo, tv_nsec, refresh,
+                                                       seq_hi, seq_lo, flags } => {
+                p.pending = p.pending.saturating_sub(1);
+                let timestamp = (((tv_sec_hi as u64) << 32) | tv_sec_lo as u64) as u128 * 1_000_000_000 + tv_nsec as u128;
+                p.record(json!({"event":"presented", "id":id, "timestamp_ns":timestamp as u64,
+                    "refresh_ns":refresh, "sequence":((seq_hi as u64)<<32)|seq_lo as u64,
+                    "flags":format!("{flags:?}")}));
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                p.pending = p.pending.saturating_sub(1);
+                p.record(json!({"event":"discarded", "id":id}));
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
@@ -269,6 +307,7 @@ impl Dispatch<WlCallback, ()> for State {
              _: &Connection, _: &QueueHandle<Self>) {
         if let wl_callback::Event::Done { .. } = event {
             state.frame_pending = false;
+            if let Some(p) = state.probe.as_mut() { p.record(json!({"event":"callback"})); }
         }
     }
 }
@@ -334,7 +373,12 @@ pub fn run(
     let conn = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
     let qh = queue.handle();
-    let mut state = State::default();
+    let mut state = State { probe: Probe::open()?, ..State::default() };
+    let presentation: Option<WpPresentation> = if state.probe.is_some() {
+        let manager = globals.bind(&qh, 1..=1, ()).ok();
+        if let Some(p) = state.probe.as_mut() { p.record(json!({"event":"capability", "presentation":manager.is_some()})); }
+        manager
+    } else { None };
     let compositor: WlCompositor = globals.bind(&qh, 4..=6, ())?;
     let layer_shell: ZwlrLayerShellV1 = globals.bind(&qh, 1..=4, ())?;
     let registry = globals.registry();
@@ -436,6 +480,10 @@ pub fn run(
                     if let Some(s) = stats.as_mut() {
                         s.consume_us += tc.elapsed().as_micros();
                     }
+                    if let Some(p) = state.probe.as_mut() {
+                        p.record(json!({"event":"consume", "generation":consumed.get(), "redraw":update.redraw,
+                            "duration_us":tc.elapsed().as_micros() as u64}));
+                    }
                     dirty |= update.redraw;
                     if spec.show_fps && update.new_frame {
                         fps_meter.1 += 1;
@@ -512,8 +560,23 @@ pub fn run(
                                 let clip_rects = clip.as_ref().map_or(1, Vec::len);
                                 history.push_front(tiles.clone());
                                 history.truncate(AGE_HISTORY);
+                                if let Some(p) = state.probe.as_mut() {
+                                    p.submitted += 1;
+                                    if let Some(manager) = presentation.as_ref() {
+                                        if p.pending < 128 {
+                                            manager.feedback(&surface, &qh, p.submitted);
+                                            p.pending += 1;
+                                        } else { p.record(json!({"event":"feedback_limit", "id":p.submitted})); }
+                                    }
+                                }
                                 if !egl.swap(report.as_deref(), buffer.1) {
                                     bail!("eglSwapBuffers failed: {:#x}", eglGetError());
+                                }
+                                if let Some(p) = state.probe.as_mut() {
+                                    let t4 = std::time::Instant::now();
+                                    p.record(json!({"event":"submit", "id":p.submitted, "generation":consumed.get(),
+                                        "fill_us":(t1-t0).as_micros() as u64, "damage_us":(t2-t1).as_micros() as u64,
+                                        "draw_submit_us":(t3-t2).as_micros() as u64, "swap_us":(t4-t3).as_micros() as u64}));
                                 }
                                 if let Some(s) = stats.as_mut() {
                                     let t4 = std::time::Instant::now();
