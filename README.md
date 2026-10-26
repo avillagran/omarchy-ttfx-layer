@@ -122,7 +122,9 @@ ones. With `--fps auto` the ceiling also respects `TTFX_BG_GPU_BUDGET`
 ## Renderer optimization candidate (isolated, not installed)
 
 `TTFX_BG_RENDER_PROFILE=reference|clipped|axis` selects the same-binary
-hardware acceptance candidate. Default/invalid values select `reference`.
+hardware acceptance candidate. An absent variable selects `clipped`, provisionally
+chosen from Matrix screening. Explicit `reference` and invalid values (including
+non-Unicode) select reference; `axis` remains an explicit alternative.
 `clipped` and `axis` include the bounded Unicode glyph-slot cache and select
 mutually exclusive GPU mapping backends. Historical optimization trial flags
 cannot override this control. Explicit `reference` is the rollback path.
@@ -132,4 +134,5 @@ Performance evidence motivating these components is limited to Matrix at equal
 resolution/parameters; the combined candidate still requires hardware acceptance.
 Other effects retain their functional contract and require rotation/dismissal
 smoke checks. No performance gain for the wider catalog or Amiga, measured watts,
-unique-content 60fps, or installed/default optimization is claimed.
+unique-content 60fps, or installed/accepted optimization is claimed. Final-SHA45s confirmation and
+catalog smoke checks remain pending; this default can be reverted if they fail.

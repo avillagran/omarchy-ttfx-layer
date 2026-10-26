@@ -2,21 +2,26 @@
 //! The selected value is copied to the grid and pipeline at layer startup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RenderProfile {
-    #[default]
     Reference,
+    #[default]
     Clipped,
     Axis,
 }
 impl RenderProfile {
     pub fn parse(value: Option<&str>) -> Self {
         match value {
+            None => Self::default(),
             Some("clipped") => Self::Clipped,
             Some("axis") => Self::Axis,
             _ => Self::Reference,
         }
     }
     pub fn from_env() -> Self {
-        Self::parse(std::env::var("TTFX_BG_RENDER_PROFILE").ok().as_deref())
+        match std::env::var("TTFX_BG_RENDER_PROFILE") {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::default(),
+            Err(std::env::VarError::NotUnicode(_)) => Self::Reference,
+        }
     }
     pub fn name(self) -> &'static str {
         match self { Self::Reference => "reference", Self::Clipped => "clipped", Self::Axis => "axis" }
@@ -25,8 +30,13 @@ impl RenderProfile {
 }
 #[cfg(test)] mod tests {
     use super::*;
-    #[test] fn absent_invalid_and_explicit_reference_select_original() {
-        for v in [None, Some(""), Some("reference"), Some("AXIS"), Some("axis "), Some("auto"), Some("1")] {
+    #[test] fn absence_selects_clipped_default() {
+        assert_eq!(RenderProfile::default(), RenderProfile::Clipped);
+        assert_eq!(RenderProfile::parse(None), RenderProfile::Clipped);
+        assert!(RenderProfile::parse(None).cached());
+    }
+    #[test] fn invalid_and_explicit_reference_select_original() {
+        for v in [Some(""), Some("reference"), Some("AXIS"), Some("axis "), Some("auto"), Some("1")] {
             assert_eq!(RenderProfile::parse(v), RenderProfile::Reference);
             assert!(!RenderProfile::parse(v).cached());
         }

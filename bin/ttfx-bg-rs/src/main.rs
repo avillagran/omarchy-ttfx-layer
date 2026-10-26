@@ -6323,18 +6323,23 @@ mod native_sgr_cache_equivalence_tests {
     #[test] fn product_profile_ignores_legacy_producer_and_cache_flags() {
         if let Ok(value)=std::env::var("TTFX_TEST_PRODUCT_PROFILE_CHILD") {
             let profile=render_profile::RenderProfile::from_env();
-            assert_eq!(profile,render_profile::RenderProfile::parse(if value=="absent"{None}else{Some(&value)}));
+            let expected=match value.as_str(){"absent"|"clipped"=>render_profile::RenderProfile::Clipped,"axis"=>render_profile::RenderProfile::Axis,_=>render_profile::RenderProfile::Reference};
+            assert_eq!(profile,expected);
             let screen=Screen::new_direct(3,2,Arc::new(std::sync::Mutex::new(vec![])),Arc::new(std::sync::atomic::AtomicU64::new(0)),Arc::new(std::sync::atomic::AtomicBool::new(false)));
             assert!(!screen.native_swap);assert!(!screen.native_sgr_cache);
             let grid=gpu_grid::GpuGrid::new(3,2,8.);
             assert_eq!(grid.glyph_slot_cache_status(),profile.cached().then_some(4096));
             return;
         }
-        for value in ["absent","reference","invalid","clipped","axis"] {
+        for value in ["absent","reference","invalid","nonunicode","clipped","axis"] {
             let mut child=std::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact","product_profile_tests::product_profile_ignores_legacy_producer_and_cache_flags","--nocapture"]);
             child.env("TTFX_TEST_PRODUCT_PROFILE_CHILD",value);
-            if value=="absent" {child.env_remove("TTFX_BG_RENDER_PROFILE");}else{child.env("TTFX_BG_RENDER_PROFILE",value);}
+            if value=="absent" {child.env_remove("TTFX_BG_RENDER_PROFILE");}
+            else if value=="nonunicode" {
+                use std::os::unix::ffi::OsStringExt;
+                child.env("TTFX_BG_RENDER_PROFILE",std::ffi::OsString::from_vec(vec![0xff]));
+            } else {child.env("TTFX_BG_RENDER_PROFILE",value);}
             for key in render_profile::LEGACY_TRIALS{child.env(key,"1");}
             assert!(child.status().unwrap().success(),"profile={value}");
         }

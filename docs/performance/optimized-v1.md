@@ -10,9 +10,10 @@ survive combination. No install, promotion, hardware acceptance or 60fps claim.
 ## One control, same binary
 
 `TTFX_BG_RENDER_PROFILE=reference|clipped|axis` is read once per Wayland layer,
-then copied into its grid and pipeline. Absence, non-Unicode or any invalid
-value selects **reference**, provisionally the default. Values are exact and
-case sensitive; no automatic GPU identity selection.
+then copied into its grid and pipeline. **Absence selects clipped**, the provisional
+v1 choice after both same-binary screenings. Explicit reference, non-Unicode and
+all other invalid values select **reference** safely. Axis remains explicit.
+Values are exact and case sensitive; no automatic GPU identity selection.
 
 | Profile | Glyph slot lookup | GPU mapping |
 |---|---|---|
@@ -93,7 +94,10 @@ acceptance. No x86/Iris result is claimed until coordinator supplies it.
 ## Hardware protocol and decision
 
 Same frozen binary, seed12345, matrix/resolution2/audio0/intensity5/speed5/cap60.
-Run reference vs clipped and reference vs axis independently, both placements.
+Initial screening ran reference vs clipped and reference vs axis independently,
+both placements. Final-SHA confirmation compares A explicit reference against
+B with the variable UNSET (expected clipped), both placements,45s OFF ABBA and
+separate feedback; six-effect smoke runs on that same final binary/default.
 Resource ABBA: 10s warmup +20s sample, no presentation/producer/stats logs, timing0.
 Separate feedback AB20s both placements: existing presentation log only, timing0,
 producer log unset. Verify effective route on EVERY submit: cache0/reference A,
@@ -122,7 +126,7 @@ After hardware selection: minimal product cleanup can remove inactive historical
 trial code/tests/docs from the chosen renderer, retain explicit reference
 rollback and safe fallback; no broad refactor or default promotion before results.
 
-## Local freeze evidence (2026-10-26, aarch64)
+## First freeze evidence (26aa717,2026-10-26,aarch64)
 
 Release `--locked --no-default-features` passed (optimized, 2m01s), without
 compiler warnings. Standalone `--probe` passed.
@@ -147,5 +151,58 @@ the frozen source SHA together. The executable name selects standalone mode;
 `--standalone --probe` must print `omarchy-ttfx-layer 1`. No prebuilt x86 checksum
 can be supplied from this ARM host. Smoke matrix,rain,decrypt,rings,thunderstorm,
 fireworks in both placements is functional validation, separate from Matrix
-ABBA, queries and capture. Final chosen default/override/reference acceptance
-and the x86 binary hash are pending hardware results, not included in this freeze.
+ABBA, queries and capture. First-freeze x86 binary hash and screening are recorded below. Final-default SHA,
+x86 rebuild/hash,45s acceptance and smoke remain pending final validation.
+
+
+## Provisional default decision after screening (not final acceptance)
+
+Coordinator tested26aa717 x86 release/full189passed16ignored and9 exact Iris6100
+EGL gates successfully. That binary SHA256 is
+`b619d6c5465bfb2af76f5dfcb63543525f95ee0ac053a83546e692121e844269`;
+it is NOT the final-default binary. Source archive SHA256
+`a568615d0b32ac9dab1532b63b6515dee53080e645fa99cd640723aac42e1eb7`.
+
+Matrix equal-parameter resource screening20s OFF ABBA, background/screensaver:
+
+| Profile | CPU A→B (one core%) | RC6 active A→B (%) |
+|---|---|---|
+| clipped/background |11.550→11.065|48.525→45.765|
+| clipped/screensaver |12.030→11.570|48.930→45.555|
+| axis/background |11.495→11.040|48.350→46.435|
+| axis/screensaver |12.205→11.390|48.485→46.185|
+
+Clipped feedback37.60/37.60background,37.60/37.65screensaver;axis37.55/37.60
+and37.60/37.65. Each profile:four full windows,0discarded,p99~33.358–33.359ms,
+every submit effective route/cache4096/fallbacknull verified,6dismisspassed,
+max78C,restorationverified. No causal watt/unique or global dominance claim.
+Sources ROOT=`~/.local/state/omarchy-ambient-bench/2026-10-26`,
+`optimized-v1/clipped-20-summary.json`, `optimized-v1/axis-20-summary.json`,
+`opt-v1-clipped-20/results` and `opt-v1-axis-20/results`.
+
+User/coordinator provisionally chose clipped: greater GPU-proxy reduction in
+both placements, no axis map/resize storage, retained CPU reduction~3.8–4.2%.
+Axis remains a functional explicit alternative with a CPU/GPU tradeoff; these
+screenings do not prove universal superiority. Only default selection, invalid
+input handling, constructor tests and docs change after26aa717. Producer,
+pacing,cache,backends,GL lifetime and fallbacks are unchanged.
+
+Acceptance requires rebuilding the NEW frozen SHA on x86, normal suite and9
+exact Iris gates, then reference vs UNSET-default45s resources/feedback in both
+placements with route validation, six-effect rotation/dismiss smoke and restore.
+No installation/promotion before that evidence. If confirmation fails, default
+must revert in a NEW local commit. Performance scope is Matrix; smoke does not
+prove catalog performance or benefit to Amiga.60fps/watts/unique remain pending.
+
+## Default-candidate local gates (2026-10-26, aarch64)
+
+Release build passed (optimized,1m39s), with no compiler warnings.
+Normal parallel full suite: **190 passed /16 ignored** (17 library +154 binary
++19 integration; subprocess fixtures excluded from totals). Nine exact EGL gates
+passed Apple M2 Pro (G14S B1), including actual default constructors under poisoned
+historical switches, empty/invalid values, and a non-Unicode environment value.
+Absent selects clipped/cache4096; explicit reference and non-Unicode select
+reference/cache0. Reader regression gates also passed. These local results do
+not replace the final x86/Iris rebuild,45s confirmation or functional smoke.
+Logs `/tmp/ambient-opt-v1-default-{full,egl,release}.log` are separate from26aa717.
+Historical ARM FD intermittency remains unresolved; no descriptor code changed.

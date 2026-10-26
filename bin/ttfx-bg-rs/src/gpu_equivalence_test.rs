@@ -257,8 +257,11 @@ fn optimized_profiles_ignore_trials_and_report_effective_route(){unsafe{
     let old=crate::render_profile::LEGACY_TRIALS.iter().map(|key|(*key,std::env::var_os(key))).collect::<Vec<_>>();
     let previous=std::env::var_os("TTFX_BG_RENDER_PROFILE");
     for key in crate::render_profile::LEGACY_TRIALS {std::env::set_var(key,"1");}
-    for value in [None,Some("reference"),Some("invalid"),Some("clipped"),Some("axis")] {
-        if let Some(value)=value{std::env::set_var("TTFX_BG_RENDER_PROFILE",value);}else{std::env::remove_var("TTFX_BG_RENDER_PROFILE");}
+    for value in [None,Some("reference"),Some(""),Some("invalid"),Some("nonunicode"),Some("clipped"),Some("axis")] {
+        if value==Some("nonunicode") {
+            use std::os::unix::ffi::OsStringExt;
+            std::env::set_var("TTFX_BG_RENDER_PROFILE",std::ffi::OsString::from_vec(vec![0xff]));
+        } else if let Some(value)=value {std::env::set_var("TTFX_BG_RENDER_PROFILE",value);}else{std::env::remove_var("TTFX_BG_RENDER_PROFILE");}
         let profile=RenderProfile::parse(value);
         let mut grid=GpuGrid::new(20,20,8.);grid.set_size(320,240,1.);grid.fill(&[]).unwrap();
         let mut pipeline=GpuPipeline::new(true).unwrap();
