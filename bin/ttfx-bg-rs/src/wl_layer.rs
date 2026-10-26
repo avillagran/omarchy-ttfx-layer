@@ -465,6 +465,7 @@ pub fn run(
                         if pipeline.is_none() {
                             crate::gpu_grid::load_gl();
                             pipeline = Some(unsafe { GpuPipeline::new(true)? });
+                            if state.probe.is_some() && std::env::var("TTFX_BG_GPU_TIMING").as_deref()==Ok("1"){unsafe{pipeline.as_mut().unwrap().enable_timing();}}
                         }
                         if spec.opaque {
                             let region = compositor.create_region(&qh, ());
@@ -576,7 +577,9 @@ pub fn run(
                                 }
                                 if let Some(p) = state.probe.as_mut() {
                                     let t4 = std::time::Instant::now();
+                                    for event in pipeline.take_timing_events(){p.record(event);}
                                     p.record(json!({"event":"submit", "id":p.submitted, "generation":consumed.get(),
+                                        "gpu_timing_frame":pipeline.timing_frame(),
                                         "cell_upload_bytes":if bench_draw {Some(pipeline.last_cell_upload_bytes())}else{None},
                                         "draw_work":if bench_draw && !pipeline.clipped_cells() {Some(pipeline.last_draw_work())}else{None},
                                         "draw_totals":if bench_draw {Some(pipeline.last_draw_totals())}else{None},
@@ -642,6 +645,8 @@ pub fn run(
         };
         frame_loop()
     };
+
+    if let Some(pipeline)=pipeline.as_mut(){let events=unsafe{pipeline.finish_timing()};if let Some(p)=state.probe.as_mut(){for e in events{p.record(e);}}}
 
     // Unmap, then destroy, and let the compositor handle each step while this
     // client still exists. Dropping the connection with the layer mapped left

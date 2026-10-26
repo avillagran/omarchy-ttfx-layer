@@ -55,12 +55,15 @@ fn assert_pixels_equal(a:&[Vec<u8>],b:&[Vec<u8>],label:&str) {
         }
     }
 }
-unsafe fn frames(upload_cache:bool,quads:bool)->(Vec<Vec<u8>>,Vec<[usize;2]>) {
+unsafe fn frames(upload_cache:bool,quads:bool)->(Vec<Vec<u8>>,Vec<[usize;2]>) {let(a,b,_)=frames_timing(upload_cache,quads,false);(a,b)}
+unsafe fn frames_timing(upload_cache:bool,quads:bool,timing:bool)->(Vec<Vec<u8>>,Vec<[usize;2]>,Vec<serde_json::Value>) {
     if upload_cache {std::env::set_var("TTFX_BG_GPU_UPLOAD_DIRTY","1");}
     else {std::env::remove_var("TTFX_BG_GPU_UPLOAD_DIRTY");}
     if quads {std::env::set_var("TTFX_BG_GPU_CELL_QUADS","1");}
     else {std::env::remove_var("TTFX_BG_GPU_CELL_QUADS");}
     let mut pipeline=GpuPipeline::new(true).unwrap();
+    if timing{pipeline.enable_timing();}
+    let mut timer_events=vec![];
     let mut grid=GpuGrid::new(20,20,8.);
     let cells:Vec<DirectCell>=(0..400).map(|i|DirectCell{
         x:i%20,y:i/20,ch:char::from_u32(0x100+i as u32).unwrap(),
@@ -83,12 +86,14 @@ unsafe fn frames(upload_cache:bool,quads:bool)->(Vec<Vec<u8>>,Vec<[usize;2]>) {
         let _=grid.damage_tiles();
         pipeline.draw(&mut grid,true,step%2==0,None);
         uploads.push(pipeline.last_cell_upload_bytes());
+        timer_events.extend(pipeline.take_timing_events());
         let mut pixels=vec![0;w as usize*h as usize*4];
         gl::ReadPixels(0,0,w,h,gl::RGBA,gl::UNSIGNED_BYTE,pixels.as_mut_ptr().cast());
         assert_eq!(gl::GetError(),gl::NO_ERROR,"GL error step {step}");
         snapshots.push(pixels);
     }
-    (snapshots,uploads)
+    timer_events.extend(pipeline.finish_timing());
+    (snapshots,uploads,timer_events)
 }
 #[test]
 #[ignore="gate GPU explícito: EGL surfaceless/pbufferRGBA8, ejecutar aislado"]
@@ -208,4 +213,17 @@ fn gpu_clipped_quads_match_reference_pixels() {unsafe {
     eprintln!("GPU clip geometry vertices R4={old_vertices} R5={new_vertices}");
     std::env::remove_var("TTFX_BG_GPU_CLIPPED_QUADS");
     std::env::remove_var("TTFX_BG_GPU_CELL_QUADS");
+}}
+
+#[test]
+#[ignore="explicit GPU timer capability/equivalence; not a resource benchmark"]
+fn gpu_timer_is_async_and_preserves_reference_pixels(){unsafe{
+    let _context=Sandbox::new();
+    let(a,_,off)=frames_timing(false,false,false);assert!(off.is_empty(),"OFF must not initialize/query timer");
+    let(b,_,events)=frames_timing(false,false,true);
+    assert_pixels_equal(&a,&b,"GPU timestamp instrumentation must preserve exact images");
+    for e in &events{eprintln!("GPU_TIMER_GATE {e}");}
+    assert!(events.iter().any(|e|e["event"]=="gpu_timer_capability"&&e["available"]==true),"timer unavailable in this context; do not claim timing");
+    assert!(events.iter().any(|e|e["event"]=="gpu_elapsed"),"no asynchronously completed valid samples");
+    assert!(!events.iter().any(|e|e["event"]=="gpu_timer_unavailable"||e["event"]=="gpu_timer_invalid"));
 }}

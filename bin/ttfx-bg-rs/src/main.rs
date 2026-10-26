@@ -33,6 +33,7 @@ mod native_publication;
 mod native_palette;
 mod gpu_upload_cache;
 mod gpu_cell_quads;
+mod gpu_timer;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;

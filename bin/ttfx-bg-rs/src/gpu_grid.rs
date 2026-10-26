@@ -31,6 +31,8 @@ extern "C" {
     fn eglGetProcAddress(name: *const c_char) -> *const c_void;
 }
 
+pub(crate) unsafe fn egl_timer_proc(name:*const c_char)->*const c_void{eglGetProcAddress(name)}
+
 pub fn load_gl() {
     gl::load_with(|name| {
         let name = CString::new(name).unwrap();
@@ -356,6 +358,8 @@ impl GpuGrid {
 
 /// GL objects. Create and use only while their context is current.
 pub struct GpuPipeline {
+    timer: Option<crate::gpu_timer::Timer>,
+    timer_events: Vec<serde_json::Value>,
     program: u32,
     vao: u32,
     fg_tex: u32,
@@ -490,6 +494,7 @@ impl GpuPipeline {
         let mut vao = 0;
         gl::GenVertexArrays(1, &mut vao);
         Ok(Self {
+            timer:None, timer_events:vec![],
             program,
             vao,
             fg_tex: new_texture(),
@@ -514,6 +519,13 @@ impl GpuPipeline {
         })
     }
 
+    pub unsafe fn enable_timing(&mut self){
+        match crate::gpu_timer::Timer::new(){Ok(timer)=>self.timer=Some(timer),Err(reason)=>self.timer_events.push(serde_json::json!({"event":"gpu_timer_unavailable","reason":reason}))}
+    }
+    pub fn timing_frame(&self)->Option<u64>{self.timer.as_ref().and_then(|t|t.frame())}
+    pub fn take_timing_events(&mut self)->Vec<serde_json::Value>{let mut events=std::mem::take(&mut self.timer_events);if let Some(t)=self.timer.as_mut(){events.extend(t.take_events())}events}
+    pub unsafe fn finish_timing(&mut self)->Vec<serde_json::Value>{if let Some(t)=self.timer.take(){self.timer_events.extend(t.finish())}self.take_timing_events()}
+
     pub fn last_cell_upload_bytes(&self)->[usize;2] {self.last_cell_upload_bytes}
     // vertices por instancia, instancias por draw, llamadas realmente emitidas.
     pub fn last_draw_work(&self)->[u64;3] {self.last_draw_work}
@@ -534,6 +546,7 @@ impl GpuPipeline {
     /// # Safety
     /// The pipeline's context must be current.
     pub unsafe fn draw(&mut self, grid: &mut GpuGrid, upload_cells: bool, opaque: bool, clip: Option<&[[i32; 4]]>) {
+        if let Some(timer)=self.timer.as_mut(){timer.begin();}
         self.last_cell_upload_bytes=[0;2];
         let atlas_was_reset=grid.atlas_reset;
         gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
@@ -578,6 +591,7 @@ impl GpuPipeline {
             }
             self.grid = (cols, rows);
         }
+        if let Some(timer)=self.timer.as_mut(){timer.after_upload();}
         gl::Disable(gl::BLEND);
         gl::UseProgram(self.program);
         gl::Uniform2f(self.u_size, grid.width as f32, grid.height as f32);
@@ -617,6 +631,7 @@ impl GpuPipeline {
         }
         gl::BindVertexArray(0);
         gl::ActiveTexture(gl::TEXTURE0);
+        if let Some(timer)=self.timer.as_mut(){timer.end();}
     }
 }
 
