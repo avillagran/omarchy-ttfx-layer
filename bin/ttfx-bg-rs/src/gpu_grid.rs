@@ -372,6 +372,9 @@ pub struct GpuPipeline {
     last_cell_upload_bytes: [usize;2],
     instanced_cells: bool,
     u_cells_mode: i32,
+    u_cell_range: i32,
+    clipped_cells: bool,
+    last_draw_totals: [u64;2],
     last_draw_work: [u64;3],
 }
 
@@ -459,7 +462,8 @@ impl GpuPipeline {
         } else {
             "#version 330 core\n"
         };
-        let instanced_cells=std::env::var("TTFX_BG_GPU_CELL_QUADS").as_deref()==Ok("1");
+        let clipped_cells=std::env::var("TTFX_BG_GPU_CLIPPED_QUADS").as_deref()==Ok("1");
+        let instanced_cells=clipped_cells || std::env::var("TTFX_BG_GPU_CELL_QUADS").as_deref()==Ok("1");
         let fragment=instanced_cells.then(||crate::gpu_cell_quads::fragment(FRAGMENT));
         let vs = compile(gl::VERTEX_SHADER, header, if instanced_cells{crate::gpu_cell_quads::VERTEX}else{VERTEX})?;
         let fs = compile(gl::FRAGMENT_SHADER, header, fragment.as_deref().unwrap_or(FRAGMENT))?;
@@ -503,6 +507,9 @@ impl GpuPipeline {
             last_cell_upload_bytes: [0;2],
             instanced_cells,
             u_cells_mode: loc("u_cells_mode"),
+            u_cell_range: loc("u_cell_range"),
+            clipped_cells,
+            last_draw_totals: [0;2],
             last_draw_work: [0;3],
         })
     }
@@ -510,10 +517,15 @@ impl GpuPipeline {
     pub fn last_cell_upload_bytes(&self)->[usize;2] {self.last_cell_upload_bytes}
     // vertices por instancia, instancias por draw, llamadas realmente emitidas.
     pub fn last_draw_work(&self)->[u64;3] {self.last_draw_work}
+    pub fn clipped_cells(&self)->bool {self.clipped_cells}
+    pub fn last_draw_totals(&self)->[u64;2] {self.last_draw_totals}
     unsafe fn draw_cells(&mut self,instances:Option<i32>) {
+        if instances==Some(0) {return;}
         if let Some(count)=instances {gl::DrawArraysInstanced(gl::TRIANGLES,0,6,count);}
         else {gl::DrawArrays(gl::TRIANGLES,0,3);}
         self.last_draw_work[2]+=1;
+        self.last_draw_totals[0]+=1;
+        self.last_draw_totals[1]+=instances.map(|n|6*n as u64).unwrap_or(3);
     }
 
     /// Upload changed state and shade `clip` (top-left based framebuffer
@@ -578,6 +590,8 @@ impl GpuPipeline {
             gl::Uniform1i(self.u_cells_mode,count.is_some() as i32);
             count
         } else {None};
+        if instances.is_some() {gl::Uniform4i(self.u_cell_range,0,0,cols,rows);}
+        self.last_draw_totals=[0;2];
         self.last_draw_work=instances.map(|n|[6,n as u64,0]).unwrap_or([3,1,0]);
         for (unit, tex) in [(0, self.fg_tex), (1, self.bg_tex), (2, self.atlas_tex)] {
             gl::ActiveTexture(gl::TEXTURE0 + unit);
@@ -590,7 +604,12 @@ impl GpuPipeline {
                 for r in rects {
                     // Scissor boxes have a bottom-left origin.
                     gl::Scissor(r[0], grid.height - r[1] - r[3], r[2], r[3]);
-                    self.draw_cells(instances);
+                    let count=if self.clipped_cells && instances.is_some() {
+                        let range=crate::gpu_cell_quads::clipped_range(cols,rows,grid.width,grid.height,*r).unwrap();
+                        gl::Uniform4i(self.u_cell_range,range[0],range[1],range[2],range[3]);
+                        Some(range[2]*range[3])
+                    } else {instances};
+                    self.draw_cells(count);
                 }
                 gl::Disable(gl::SCISSOR_TEST);
             }

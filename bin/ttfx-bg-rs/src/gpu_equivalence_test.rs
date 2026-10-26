@@ -152,3 +152,60 @@ fn gpu_cell_quads_match_reference_pixels() {unsafe {
     for i in (0..baseline.len()).step_by(3) {assert_pixels_equal(std::slice::from_ref(&baseline[i]),std::slice::from_ref(&fallback[i]),"fallback");}
     std::env::remove_var("TTFX_BG_GPU_CELL_QUADS");
 }}
+
+/// Buffers previos coherentes: sólo se altera contenido cuya celda entera está
+/// incluida en el clip. El full redraw sirve de oráculo también fuera del daño.
+unsafe fn coherent_clips(variant:u8,full_redraw:bool)->(Vec<Vec<u8>>,u64) {
+    std::env::remove_var("TTFX_BG_GPU_UPLOAD_DIRTY");
+    std::env::set_var("TTFX_BG_GPU_CELL_QUADS",if variant==1{"1"}else{"0"});
+    std::env::set_var("TTFX_BG_GPU_CLIPPED_QUADS",if variant==2{"1"}else{"0"});
+    let mut snapshots=vec![];let mut vertices=0;
+    for (cols,rows,w,h) in [(237,61,2560,1600),(237,61,509,337),(80,24,17,13),(1,1,97,59),(80,24,511,383)] {
+        for opaque in [false,true] {
+            let mut pipeline=GpuPipeline::new(true).unwrap();
+            let mut grid=GpuGrid::new(cols,rows,8.);grid.set_size(w,h,1.);
+            let mut cells:Vec<DirectCell>=(0..cols*rows).map(|i|DirectCell {
+                x:i%cols,y:i/cols,ch:char::from_u32(0x100+(i%400)as u32).unwrap(),
+                color:((i%255)as u8,120,220),background:if i%3==0{Some((30,60,90))}else{None},attrs:if i%5==0{4}else{0},
+            }).collect();
+            gl::Viewport(0,0,w,h);gl::ClearColor(0.13,0.21,0.34,0.55);gl::Clear(gl::COLOR_BUFFER_BIT);
+            for step in 0..5 {
+                let cell=match step {1=>0,2=>cells.len()/2,_=>cells.len()-1};
+                if step>0 {cells[cell].color=(step*43,2,255-step*17);cells[cell].background=Some((step,55,100));}
+                let x=cells[cell].x as i32;let y=cells[cell].y as i32;
+                let x0=x*w/cols as i32;let x1=(x+1)*w/cols as i32;
+                let y0=y*h/rows as i32;let y1=(y+1)*h/rows as i32;
+                let clips=[[x0,y0,x1-x0,y1-y0],[w/3,0,1,h],[0,h/3,w,1],[0,0,1,1],[w-1,h-1,1,1],[w,0,0,h]];
+                grid.fill(&cells).unwrap();let _=grid.damage_tiles();
+                pipeline.draw(&mut grid,true,opaque,if step==0||full_redraw{None}else{Some(&clips)});
+                vertices+=pipeline.last_draw_totals()[1];
+                assert_eq!(gl::GetError(),gl::NO_ERROR,"clip variant{variant} step{step}");
+                let mut pixels=vec![0;w as usize*h as usize*4];
+                gl::ReadPixels(0,0,w,h,gl::RGBA,gl::UNSIGNED_BYTE,pixels.as_mut_ptr().cast());
+                assert_eq!(gl::GetError(),gl::NO_ERROR);snapshots.push(pixels);
+            }
+        }
+    }
+    (snapshots,vertices)
+}
+#[test]
+#[ignore="gate GPU explícito: quads acotados por clip contra fullscreen original y oráculo completo"]
+fn gpu_clipped_quads_match_reference_pixels() {unsafe {
+    let _context=Sandbox::new();
+    std::env::set_var("TTFX_BG_GPU_CLIPPED_QUADS","0");
+    let(a,_)=frames(false,false);
+    std::env::set_var("TTFX_BG_GPU_CLIPPED_QUADS","1");
+    let(b,_)=frames(false,false);
+    assert_pixels_equal(&a,&b,"clippedquads/slotsaltos/reset/resize");
+    let(full,_)=coherent_clips(0,true);
+    let(reference,_)=coherent_clips(0,false);
+    let(old,old_vertices)=coherent_clips(1,false);
+    let(candidate,new_vertices)=coherent_clips(2,false);
+    assert_pixels_equal(&full,&reference,"coherencia del oráculo/daño");
+    assert_pixels_equal(&reference,&old,"referencia R4");
+    assert_pixels_equal(&reference,&candidate,"quads porclip/seams/alpha/estadofuera");
+    assert!(new_vertices<old_vertices,"debe eliminar geometría repetida fuera de clips");
+    eprintln!("GPU clip geometry vertices R4={old_vertices} R5={new_vertices}");
+    std::env::remove_var("TTFX_BG_GPU_CLIPPED_QUADS");
+    std::env::remove_var("TTFX_BG_GPU_CELL_QUADS");
+}}
