@@ -32,6 +32,7 @@ mod producer_probe;
 mod native_publication;
 mod native_palette;
 mod gpu_upload_cache;
+mod gpu_cell_quads;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;
