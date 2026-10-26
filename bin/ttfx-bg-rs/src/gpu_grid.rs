@@ -368,6 +368,8 @@ pub struct GpuPipeline {
     u_cell: i32,
     u_atlas_cols: i32,
     u_opaque: i32,
+    cell_upload_cache: Option<crate::gpu_upload_cache::UploadCache>,
+    last_cell_upload_bytes: [usize;2],
 }
 
 
@@ -491,8 +493,13 @@ impl GpuPipeline {
             u_cell: loc("u_cell"),
             u_atlas_cols: loc("u_atlas_cols"),
             u_opaque: loc("u_opaque"),
+            cell_upload_cache: (std::env::var("TTFX_BG_GPU_UPLOAD_DIRTY").as_deref()==Ok("1"))
+                .then(crate::gpu_upload_cache::UploadCache::default),
+            last_cell_upload_bytes: [0;2],
         })
     }
+
+    pub fn last_cell_upload_bytes(&self)->[usize;2] {self.last_cell_upload_bytes}
 
     /// Upload changed state and shade `clip` (top-left based framebuffer
     /// pixels), or everything when `None`; the rest keeps its previous content.
@@ -500,6 +507,8 @@ impl GpuPipeline {
     /// # Safety
     /// The pipeline's context must be current.
     pub unsafe fn draw(&mut self, grid: &mut GpuGrid, upload_cells: bool, opaque: bool, clip: Option<&[[i32; 4]]>) {
+        self.last_cell_upload_bytes=[0;2];
+        let atlas_was_reset=grid.atlas_reset;
         gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
         let (cols, rows) = (grid.cols as i32, grid.rows as i32);
         if grid.atlas_reset {
@@ -522,7 +531,12 @@ impl GpuPipeline {
         }
         let resized = self.grid != (cols, rows);
         if resized || upload_cells {
-            for (tex, data) in [(self.fg_tex, &grid.fg), (self.bg_tex, &grid.bg)] {
+            let sent=self.cell_upload_cache.as_ref()
+                .map(|cache|cache.plan((cols,rows),&grid.fg,&grid.bg,resized||atlas_was_reset))
+                .unwrap_or([true,true]);
+            for (index,(tex, data)) in [(self.fg_tex, &grid.fg), (self.bg_tex, &grid.bg)].into_iter().enumerate() {
+                if !sent[index] {continue;}
+                self.last_cell_upload_bytes[index]=data.len();
                 gl::BindTexture(gl::TEXTURE_2D, tex);
                 if resized {
                     gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA8 as i32, cols, rows, 0,
@@ -531,6 +545,9 @@ impl GpuPipeline {
                     gl::TexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, cols, rows,
                         gl::RGBA, gl::UNSIGNED_BYTE, data.as_ptr() as *const c_void);
                 }
+            }
+            if let Some(cache)=self.cell_upload_cache.as_mut() {
+                cache.commit((cols,rows),&grid.fg,&grid.bg,sent);
             }
             self.grid = (cols, rows);
         }
@@ -671,3 +688,7 @@ mod coalesce_tests {
         assert_eq!(rects, vec![[0, 0, 100, 100]]);
     }
 }
+
+#[cfg(test)]
+#[path="gpu_equivalence_test.rs"]
+mod equivalence_test;

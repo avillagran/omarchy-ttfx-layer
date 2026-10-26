@@ -577,6 +577,7 @@ pub fn run(
                                 if let Some(p) = state.probe.as_mut() {
                                     let t4 = std::time::Instant::now();
                                     p.record(json!({"event":"submit", "id":p.submitted, "generation":consumed.get(),
+                                        "cell_upload_bytes":if bench_draw {Some(pipeline.last_cell_upload_bytes())}else{None},
                                         "fill_us":(t1-t0).as_micros() as u64, "damage_us":(t2-t1).as_micros() as u64,
                                         "draw_submit_us":(t3-t2).as_micros() as u64, "swap_us":(t4-t3).as_micros() as u64}));
                                 }
