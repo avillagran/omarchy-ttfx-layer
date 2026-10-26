@@ -446,6 +446,8 @@ pub fn run(
     // whole buffer every frame (isolates the shader cost).
     let bench_draw = std::env::var("TTFX_BG_WL_DRAW").ok().as_deref() != Some("0");
     let bench_full_clip = std::env::var("TTFX_BG_WL_CLIP").ok().as_deref() == Some("none");
+    let defer_consume = std::env::var("TTFX_BG_WL_DEFER_CONSUME").as_deref() == Ok("1");
+    if let Some(p) = state.probe.as_mut() { p.record(json!({"event":"candidate", "defer_consume":defer_consume})); }
     let wl_fd = conn.backend().poll_fd().as_raw_fd();
 
     let result = {
@@ -474,7 +476,7 @@ pub fn run(
                     }
                 }
 
-                if generation.load(Ordering::Acquire) != consumed.get() {
+                if (!defer_consume || !state.frame_pending) && generation.load(Ordering::Acquire) != consumed.get() {
                     let tc = std::time::Instant::now();
                     let update = frame_handoff::consume_latest(&snapshot, &generation, &consumed, &mut visible, false);
                     if let Some(s) = stats.as_mut() {
