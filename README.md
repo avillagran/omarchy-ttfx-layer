@@ -118,3 +118,18 @@ ones. With `--fps auto` the ceiling also respects `TTFX_BG_GPU_BUDGET`
 
 - Omarchy / Hyprland on Wayland.
 - Same-arch prebuilt binary included; rebuild needs Rust, `gtk4`, `gtk4-layer-shell`, `pkg-config` and, on x86_64, `nasm`. `vte4` only for the optional Vte renderer.
+
+## Renderer optimization candidate (isolated, not installed)
+
+`TTFX_BG_RENDER_PROFILE=reference|clipped|axis` selects the same-binary
+hardware acceptance candidate. Default/invalid values select `reference`.
+`clipped` and `axis` include the bounded Unicode glyph-slot cache and select
+mutually exclusive GPU mapping backends. Historical optimization trial flags
+cannot override this control. Explicit `reference` is the rollback path.
+
+See [the v1 build, exact-image gates and A/B protocol](docs/performance/optimized-v1.md).
+Performance evidence motivating these components is limited to Matrix at equal
+resolution/parameters; the combined candidate still requires hardware acceptance.
+Other effects retain their functional contract and require rotation/dismissal
+smoke checks. No performance gain for the wider catalog or Amiga, measured watts,
+unique-content 60fps, or installed/default optimization is claimed.

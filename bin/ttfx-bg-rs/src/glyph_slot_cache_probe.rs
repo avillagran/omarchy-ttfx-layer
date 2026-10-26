@@ -39,3 +39,14 @@ fn actual_general_glyph_slot_cache_cpu_profile(){
     let styles:Vec<_>=(0..128).filter(|s|s&!STYLE_BITS==0).collect();
     for (label,keys) in [("unicode512_styles",(0..512).map(|i|(char::from_u32(0x100+i).unwrap(),styles[i as usize%styles.len()])).collect::<Vec<_>>()),("adversarial24",adversarial(24)),("adversarial512",adversarial(512)),("unicode1536_styles",(0..1536).map(|i|(char::from_u32(0x100+i).unwrap(),styles[i as usize%styles.len()])).collect())]{let frames:Vec<_>=(0..96).map(|step|{let mut f=cells(&keys,step);if step%2!=0{f.reverse();}f}).collect();profile(label,&frames);}
 }
+
+#[test]fn combined_profiles_preserve_real_native_publications_and_atlas_order(){
+    let frames=native_frames(16);
+    let mut grids=[RenderProfile::Reference,RenderProfile::Clipped,RenderProfile::Axis].map(|profile|{let mut grid=GpuGrid::with_profile(237,61,9.,profile);grid.set_size(2560,1600,2.);grid});
+    for(i,frame)in frames.iter().enumerate(){
+        if i==8{for grid in &mut grids{grid.reset_atlas();}}
+        for grid in &mut grids{grid.fill(frame).unwrap();}
+        equal(&grids[0],&grids[1]);equal(&grids[0],&grids[2]);
+        for grid in &mut grids{grid.pending_masks.clear();}
+    }
+}

@@ -18,6 +18,7 @@ use gtk4::cairo::{Context, Format, ImageSurface};
 use gtk4::pango;
 
 use crate::DirectCell;
+use crate::render_profile::RenderProfile;
 
 const STYLE_BITS: u64 = 1 | 2 | 4 | 64;
 const HIDDEN: u64 = 32;
@@ -29,6 +30,7 @@ const TILE_H: usize = 4;
 #[link(name = "EGL")]
 extern "C" {
     fn eglGetProcAddress(name: *const c_char) -> *const c_void;
+    fn eglGetCurrentContext() -> *mut c_void;
 }
 
 pub(crate) unsafe fn egl_timer_proc(name:*const c_char)->*const c_void{eglGetProcAddress(name)}
@@ -101,7 +103,12 @@ fn rect_union(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
 
 impl GpuGrid {
     /// `font_size` is in logical pixels, like the CPU atlas.
+    #[cfg(test)]
     pub fn new(cols: usize, rows: usize, font_size: f64) -> Self {
+        Self::with_profile(cols, rows, font_size, RenderProfile::from_env())
+    }
+
+    pub fn with_profile(cols: usize, rows: usize, font_size: f64, profile: RenderProfile) -> Self {
         Self {
             cols: cols.max(1),
             rows: rows.max(1),
@@ -121,7 +128,7 @@ impl GpuGrid {
             prev_fg: Vec::new(),
             prev_bg: Vec::new(),
             force_full: true,
-            slot_cache: (std::env::var("TTFX_BG_GPU_GLYPH_SLOT_CACHE").as_deref()==Ok("1")).then(crate::glyph_slot_cache::SlotCache::new),
+            slot_cache: profile.cached().then(crate::glyph_slot_cache::SlotCache::new),
         }
     }
 
@@ -366,6 +373,12 @@ impl GpuGrid {
 
 /// GL objects. Create and use only while their context is current.
 pub struct GpuPipeline {
+    owner_context: *mut c_void,
+    profile: RenderProfile,
+    backend: RenderProfile,
+    initialization_fallback: Option<&'static str>,
+    draw_fallback: Option<&'static str>,
+    axis:Option<crate::gpu_axis_lookup::AxisLookup>,
     timer: Option<crate::gpu_timer::Timer>,
     timer_events: Vec<serde_json::Value>,
     program: u32,
@@ -465,20 +478,47 @@ unsafe fn new_texture() -> u32 {
     tex
 }
 
+#[cfg(test)]
+thread_local! { static FORCE_BACKEND_SHADER_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 impl GpuPipeline {
     /// # Safety
     /// The context must be current and `load_gl` must have run.
+    #[cfg(test)]
     pub unsafe fn new(gles: bool) -> Result<Self> {
+        Self::with_profile(gles, RenderProfile::from_env())
+    }
+
+    pub unsafe fn with_profile(gles: bool, profile: RenderProfile) -> Result<Self> {
+        match Self::build(gles, profile) {
+            Ok(pipeline) => Ok(pipeline),
+            Err(error) if profile != RenderProfile::Reference => {
+                eprintln!("render profile {}: backend unavailable ({error}); using reference GPU mapping", profile.name());
+                let mut pipeline = Self::build(gles, RenderProfile::Reference)?;
+                pipeline.profile = profile;
+                pipeline.initialization_fallback = Some("backend_initialization_failed");
+                Ok(pipeline)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    unsafe fn build(gles: bool, profile: RenderProfile) -> Result<Self> {
         let header = if gles {
             "#version 300 es\nprecision highp float;\nprecision highp int;\n"
         } else {
             "#version 330 core\n"
         };
-        let clipped_cells=std::env::var("TTFX_BG_GPU_CLIPPED_QUADS").as_deref()==Ok("1");
-        let instanced_cells=clipped_cells || std::env::var("TTFX_BG_GPU_CELL_QUADS").as_deref()==Ok("1");
-        let fragment=instanced_cells.then(||crate::gpu_cell_quads::fragment(FRAGMENT));
+        let clipped_cells = profile == RenderProfile::Clipped;
+        let instanced_cells = clipped_cells;
+        let axis_requested = profile == RenderProfile::Axis;
+        let fragment=if instanced_cells{Some(crate::gpu_cell_quads::fragment(FRAGMENT))}else{axis_requested.then(||crate::gpu_axis_lookup::fragment(FRAGMENT))};
+        #[cfg(test)]
+        let fragment=if FORCE_BACKEND_SHADER_FAILURE.with(|fail|fail.get()) && profile!=RenderProfile::Reference {Some("deliberately invalid GLSL for fallback gate".to_string())}else{fragment};
         let vs = compile(gl::VERTEX_SHADER, header, if instanced_cells{crate::gpu_cell_quads::VERTEX}else{VERTEX})?;
-        let fs = compile(gl::FRAGMENT_SHADER, header, fragment.as_deref().unwrap_or(FRAGMENT))?;
+        let fs = match compile(gl::FRAGMENT_SHADER, header, fragment.as_deref().unwrap_or(FRAGMENT)) {
+            Ok(fs) => fs, Err(error) => { gl::DeleteShader(vs); return Err(error); }
+        };
         let program = gl::CreateProgram();
         gl::AttachShader(program, vs);
         gl::AttachShader(program, fs);
@@ -501,7 +541,16 @@ impl GpuPipeline {
         gl::Uniform1i(loc("u_atlas"), 2);
         let mut vao = 0;
         gl::GenVertexArrays(1, &mut vao);
+        let axis = if axis_requested {
+            match crate::gpu_axis_lookup::AxisLookup::new(program) {
+                Ok(axis) => Some(axis),
+                Err(error) => { gl::DeleteVertexArrays(1, &vao); gl::DeleteProgram(program); return Err(anyhow!(error)); }
+            }
+        } else { None };
         Ok(Self {
+            owner_context: eglGetCurrentContext(),
+            profile, backend: profile, initialization_fallback: None, draw_fallback: None,
+            axis,
             timer:None, timer_events:vec![],
             program,
             vao,
@@ -515,8 +564,7 @@ impl GpuPipeline {
             u_cell: loc("u_cell"),
             u_atlas_cols: loc("u_atlas_cols"),
             u_opaque: loc("u_opaque"),
-            cell_upload_cache: (std::env::var("TTFX_BG_GPU_UPLOAD_DIRTY").as_deref()==Ok("1"))
-                .then(crate::gpu_upload_cache::UploadCache::default),
+            cell_upload_cache: None,
             last_cell_upload_bytes: [0;2],
             instanced_cells,
             u_cells_mode: loc("u_cells_mode"),
@@ -527,6 +575,17 @@ impl GpuPipeline {
         })
     }
 
+    pub fn profile_status(&self, grid: &GpuGrid) -> serde_json::Value {
+        let fallback = self.initialization_fallback.or(self.draw_fallback);
+        serde_json::json!({
+            "profile": self.profile.name(),
+            "cache": if grid.slot_cache.is_some() { "glyph-slot-256" } else { "none" },
+            "cache_payload_bytes": grid.glyph_slot_cache_status().unwrap_or(0),
+            "backend": if fallback.is_some() { "reference" } else { self.backend.name() },
+            "fallback": fallback,
+        })
+    }
+    pub fn axis_status(&self)->Option<serde_json::Value>{self.axis.as_ref().map(|a|serde_json::json!({"active":a.active,"uploaded_bytes":a.upload_bytes,"rebuild_axes":a.rebuilds,"payload_bytes":a.payload_bytes(),"resize_cpu_ns":a.resize_cpu_ns,"resize_wall_ns":a.resize_wall_ns}))}
     pub unsafe fn enable_timing(&mut self){
         match crate::gpu_timer::Timer::new(){Ok(timer)=>self.timer=Some(timer),Err(reason)=>self.timer_events.push(serde_json::json!({"event":"gpu_timer_unavailable","reason":reason}))}
     }
@@ -599,6 +658,7 @@ impl GpuPipeline {
             }
             self.grid = (cols, rows);
         }
+        if let Some(axis)=self.axis.as_mut(){axis.ensure(grid.width,grid.height,cols,rows);}
         if let Some(timer)=self.timer.as_mut(){timer.after_upload();}
         gl::Disable(gl::BLEND);
         gl::UseProgram(self.program);
@@ -607,8 +667,10 @@ impl GpuPipeline {
         gl::Uniform2f(self.u_cell, grid.cell_w as f32, grid.cell_h as f32);
         gl::Uniform1i(self.u_atlas_cols, grid.atlas_cols);
         gl::Uniform1i(self.u_opaque, opaque as i32);
+        self.draw_fallback = None;
         let instances=if self.instanced_cells {
             let count=crate::gpu_cell_quads::instance_count(cols,rows,grid.width,grid.height);
+            if count.is_none() { self.draw_fallback = Some("unsafe_cell_geometry"); }
             gl::Uniform1i(self.u_cells_mode,count.is_some() as i32);
             count
         } else {None};
@@ -619,6 +681,7 @@ impl GpuPipeline {
             gl::ActiveTexture(gl::TEXTURE0 + unit);
             gl::BindTexture(gl::TEXTURE_2D, tex);
         }
+        if let Some(axis)=self.axis.as_ref(){axis.bind();if !axis.active {self.draw_fallback=Some(axis.fallback_reason().unwrap_or("axis_limits"));}}
         gl::BindVertexArray(self.vao);
         match clip {
             Some(rects) => {
@@ -641,6 +704,21 @@ impl GpuPipeline {
         gl::ActiveTexture(gl::TEXTURE0);
         if let Some(timer)=self.timer.as_mut(){timer.end();}
     }
+}
+
+impl Drop for GpuPipeline {
+    fn drop(&mut self) { unsafe {
+        // GL identifiers belong to the captured context. If it is no longer
+        // current, its destruction owns reclamation; never delete in a stranger.
+        if self.owner_context.is_null() || eglGetCurrentContext() != self.owner_context { return; }
+        if let Some(timer) = self.timer.take() { let _ = timer.finish(); }
+        let mut current = 0; gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut current);
+        if current as u32 == self.program { gl::UseProgram(0); }
+        if let Some(axis) = self.axis.as_mut() { axis.release_current(); }
+        gl::DeleteTextures(3, [self.fg_tex, self.bg_tex, self.atlas_tex].as_ptr());
+        gl::DeleteVertexArrays(1, &self.vao);
+        gl::DeleteProgram(self.program);
+    }}
 }
 
 #[cfg(test)]

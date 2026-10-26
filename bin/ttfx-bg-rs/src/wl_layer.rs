@@ -426,7 +426,8 @@ pub fn run(
     }
 
     let mut egl = unsafe { Egl::new(&conn, spec.opaque)? };
-    let mut grid = GpuGrid::new(spec.cols, spec.rows, spec.cell_px);
+    let profile = crate::render_profile::RenderProfile::from_env();
+    let mut grid = GpuGrid::with_profile(spec.cols, spec.rows, spec.cell_px, profile);
     let mut pipeline: Option<GpuPipeline> = None;
     let mut visible = Vec::<DirectCell>::new();
     let consumed = std::cell::Cell::new(0u64);
@@ -441,13 +442,12 @@ pub fn run(
     let policy = damage_policy();
     // TTFX_BG_WL_STATS=1 logs per-stage frame timings every 5 seconds.
     let mut stats = (std::env::var("TTFX_BG_WL_STATS").ok().as_deref() == Some("1")).then(Stats::default);
-    // Benchmark-only knobs: TTFX_BG_WL_DRAW=0 commits frames without drawing
-    // (isolates the per-frame fixed cost); TTFX_BG_WL_CLIP=none repaints the
-    // whole buffer every frame (isolates the shader cost).
-    let bench_draw = std::env::var("TTFX_BG_WL_DRAW").ok().as_deref() != Some("0");
-    let bench_full_clip = std::env::var("TTFX_BG_WL_CLIP").ok().as_deref() == Some("none");
-    let defer_consume = std::env::var("TTFX_BG_WL_DEFER_CONSUME").as_deref() == Ok("1");
-    if let Some(p) = state.probe.as_mut() { p.record(json!({"event":"candidate", "defer_consume":defer_consume})); }
+    // All profiles keep the original draw, clip and handoff semantics.
+    // Historical WL_DRAW/WL_CLIP/DEFER_CONSUME trials are ignored.
+    let bench_draw = true; // Historical rendering trials cannot override a product profile.
+    let bench_full_clip = false;
+    let defer_consume = false;
+    if let Some(p) = state.probe.as_mut() { p.record(json!({"event":"candidate", "defer_consume":defer_consume, "render_profile_requested":profile.name()})); }
     let wl_fd = conn.backend().poll_fd().as_raw_fd();
 
     let result = {
@@ -464,7 +464,7 @@ pub fn run(
                         unsafe { egl.ensure_surface(&surface, size.0, size.1)? };
                         if pipeline.is_none() {
                             crate::gpu_grid::load_gl();
-                            pipeline = Some(unsafe { GpuPipeline::new(true)? });
+                            pipeline = Some(unsafe { GpuPipeline::with_profile(true, profile)? });
                             if state.probe.is_some() && std::env::var("TTFX_BG_GPU_TIMING").as_deref()==Ok("1"){unsafe{pipeline.as_mut().unwrap().enable_timing();}}
                         }
                         if spec.opaque {
@@ -579,8 +579,9 @@ pub fn run(
                                     let t4 = std::time::Instant::now();
                                     for event in pipeline.take_timing_events(){p.record(event);}
                                     p.record(json!({"event":"submit", "id":p.submitted, "generation":consumed.get(),
-                                        "gpu_timing_frame":pipeline.timing_frame(),
+                                        "gpu_timing_frame":pipeline.timing_frame(),"axis_lookup":pipeline.axis_status(),
                                         "glyph_slot_cache_payload_bytes":grid.glyph_slot_cache_status(),
+                                        "render_profile":pipeline.profile_status(&grid),
                                         "cell_upload_bytes":if bench_draw {Some(pipeline.last_cell_upload_bytes())}else{None},
                                         "draw_work":if bench_draw && !pipeline.clipped_cells() {Some(pipeline.last_draw_work())}else{None},
                                         "draw_totals":if bench_draw {Some(pipeline.last_draw_totals())}else{None},
@@ -655,6 +656,7 @@ pub fn run(
     surface.attach(None, 0, 0);
     surface.commit();
     let _ = queue.roundtrip(&mut state);
+    drop(pipeline.take()); // Release GL objects while their owner context is current.
     drop(egl);
     layer.destroy();
     surface.destroy();
@@ -665,7 +667,8 @@ pub fn run(
 /// What the compositor is told to repaint. Hyprland unions the damage of its
 /// last frames and, past 8 rectangles, repaints their bounding box instead;
 /// a couple of merged rectangles per frame keep its partial repaint working.
-/// `TTFX_BG_WL_DAMAGE` = `full` | `bbox` | `all` | a maximum rectangle count;
+/// Product profiles fix this to the original rectangle budget; the historical
+/// `TTFX_BG_WL_DAMAGE` trial variable is ignored. Old parser accepts
 /// `min` reports a single pixel and exists only to measure the compositor's
 /// fixed per-frame cost (the screen does not refresh properly with it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -685,7 +688,7 @@ fn thread_cpu_us() -> u128 {
 }
 
 fn damage_policy() -> DamagePolicy {
-    parse_damage_policy(std::env::var("TTFX_BG_WL_DAMAGE").ok().as_deref())
+    parse_damage_policy(None) // Keep the original damage contract for every profile.
 }
 
 fn parse_damage_policy(value: Option<&str>) -> DamagePolicy {
