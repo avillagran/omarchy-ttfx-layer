@@ -227,3 +227,14 @@ fn gpu_timer_is_async_and_preserves_reference_pixels(){unsafe{
     assert!(events.iter().any(|e|e["event"]=="gpu_elapsed"),"no asynchronously completed valid samples");
     assert!(!events.iter().any(|e|e["event"]=="gpu_timer_unavailable"||e["event"]=="gpu_timer_invalid"));
 }}
+
+#[test]
+#[ignore="general Unicode slot cache exact normalized pixels, clips and coherent prior content"]
+fn gpu_glyph_slot_cache_matches_original_pixels(){unsafe{
+    let _context=Sandbox::new();
+    std::env::set_var("TTFX_BG_GPU_GLYPH_SLOT_CACHE","0");let(a,_)=frames(false,false);let(full,_)=coherent_clips(0,true);let(reference,_)=coherent_clips(0,false);
+    std::env::set_var("TTFX_BG_GPU_GLYPH_SLOT_CACHE","1");let(b,_)=frames(false,false);let(candidate,_)=coherent_clips(0,false);
+    assert_pixels_equal(&a,&b,"general glyph cache/normalized slots>255/flags/alpha/reset/resize");
+    assert_pixels_equal(&full,&reference,"coherent original full oracle");assert_pixels_equal(&reference,&candidate,"slot cache/panel/seams/overlap/degenerate/outside damage");
+    std::env::remove_var("TTFX_BG_GPU_GLYPH_SLOT_CACHE");
+}}

@@ -25,6 +25,7 @@ mod fps_governor;
 mod standalone;
 mod frame_wakeup;
 mod gpu_grid;
+mod glyph_slot_cache;
 mod occlusion;
 mod wl_layer;
 mod presentation_probe;

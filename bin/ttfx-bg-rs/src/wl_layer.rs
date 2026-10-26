@@ -580,6 +580,7 @@ pub fn run(
                                     for event in pipeline.take_timing_events(){p.record(event);}
                                     p.record(json!({"event":"submit", "id":p.submitted, "generation":consumed.get(),
                                         "gpu_timing_frame":pipeline.timing_frame(),
+                                        "glyph_slot_cache_payload_bytes":grid.glyph_slot_cache_status(),
                                         "cell_upload_bytes":if bench_draw {Some(pipeline.last_cell_upload_bytes())}else{None},
                                         "draw_work":if bench_draw && !pipeline.clipped_cells() {Some(pipeline.last_draw_work())}else{None},
                                         "draw_totals":if bench_draw {Some(pipeline.last_draw_totals())}else{None},

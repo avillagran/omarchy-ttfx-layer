@@ -60,6 +60,7 @@ pub struct GpuGrid {
     prev_fg: Vec<u8>,
     prev_bg: Vec<u8>,
     force_full: bool,
+    slot_cache: Option<crate::glyph_slot_cache::SlotCache>,
 }
 
 
@@ -120,6 +121,7 @@ impl GpuGrid {
             prev_fg: Vec::new(),
             prev_bg: Vec::new(),
             force_full: true,
+            slot_cache: (std::env::var("TTFX_BG_GPU_GLYPH_SLOT_CACHE").as_deref()==Ok("1")).then(crate::glyph_slot_cache::SlotCache::new),
         }
     }
 
@@ -152,6 +154,8 @@ impl GpuGrid {
     /// Changed tiles (TILE_W x TILE_H cells, row-major) since the previous
     /// call; `None` means the whole surface. Glyphs never leave their cell,
     /// so cell bounds are exact.
+    pub fn glyph_slot_cache_status(&self)->Option<usize>{self.slot_cache.as_ref().map(|_|crate::glyph_slot_cache::SlotCache::payload_bytes())}
+
     pub fn damage_tiles(&mut self) -> Option<Vec<bool>> {
         let full = self.force_full || self.prev_fg.len() != self.fg.len();
         let (cols, rows) = (self.cols, self.rows);
@@ -234,6 +238,7 @@ impl GpuGrid {
 
     fn reset_atlas(&mut self) {
         self.slots.clear();
+        if let Some(cache)=self.slot_cache.as_mut(){cache.clear();}
         self.pending_masks.clear();
         self.atlas_reset = true;
     }
@@ -286,7 +291,9 @@ impl GpuGrid {
     }
 
     fn slot_for(&mut self, ch: char, style: u64) -> Result<Option<u16>> {
+        if let Some(cache)=self.slot_cache.as_mut(){if let Some(slot)=cache.get(ch,style){return Ok(Some(slot));}}
         if let Some(&slot) = self.slots.get(&(ch, style)) {
+            if let Some(cache)=self.slot_cache.as_mut(){cache.insert(ch,style,slot);}
             return Ok(Some(slot));
         }
         let slot = self.slots.len() + 1;
@@ -296,6 +303,7 @@ impl GpuGrid {
         let slot = slot as u16;
         let mask = self.rasterize_mask(ch, style)?;
         self.slots.insert((ch, style), slot);
+        if let Some(cache)=self.slot_cache.as_mut(){cache.insert(ch,style,slot);}
         self.pending_masks.push((slot, mask));
         Ok(Some(slot))
     }
@@ -747,3 +755,7 @@ mod coalesce_tests {
 #[cfg(test)]
 #[path="gpu_equivalence_test.rs"]
 mod equivalence_test;
+
+#[cfg(test)]
+#[path="glyph_slot_cache_probe.rs"]
+mod glyph_slot_cache_probe;
