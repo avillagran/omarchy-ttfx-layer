@@ -29,6 +29,7 @@ mod occlusion;
 mod wl_layer;
 mod presentation_probe;
 mod producer_probe;
+mod native_publication;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;
@@ -2278,6 +2279,7 @@ struct Screen {
     // Reused by the producer; copying into the slot retains both Vec
     // allocations across frames instead of allocating a fresh publish Vec.
     direct_cells: Option<Vec<DirectCell>>,
+    native_swap: bool,
     // Direct catalog frames decode SGR once per run, then retain typed RGB at
     // the cell. Native effects still use their existing ANSI-string storage.
     direct_colors: Option<Vec<Vec<Option<(u8, u8, u8)>>>>,
@@ -2305,6 +2307,7 @@ impl Screen {
             snapshot: None,
             direct_snapshot: None,
             direct_cells: None,
+            native_swap: false,
             direct_colors: None,
             occupied: None,
             snapshot_gen: None,
@@ -2338,6 +2341,7 @@ impl Screen {
         scr.headless = true;
         scr.direct_snapshot = Some(snapshot);
         scr.direct_cells = Some(Vec::new());
+        scr.native_swap = std::env::var("TTFX_BG_NATIVE_SWAP").as_deref()==Ok("1");
         scr.direct_colors = Some(vec![vec![None; cols]; rows]);
         scr.occupied = Some(DirectOccupancy::new(cols, rows));
         scr.snapshot_gen = Some(gen);
@@ -2361,6 +2365,7 @@ impl Screen {
             snapshot: None,
             direct_snapshot: None,
             direct_cells: None,
+            native_swap: false,
             direct_colors: None,
             occupied: None,
             snapshot_gen: None,
@@ -2514,7 +2519,9 @@ impl Screen {
                 if self.stop_flag.as_ref().is_some_and(|stop| stop.load(Ordering::Acquire)) {
                     return;
                 }
-                current.clone_from(cells);
+                native_publication::publish(&mut current, cells, self.native_swap);
+                #[cfg(test)]
+                native_publication::capture_frame(&current, self.stop_flag.as_deref());
                 // Publish the frame and its generation under one lock. The
                 // consumer must not observe a newer frame with an older ID.
                 let committed = gen.fetch_add(1, Ordering::Release) + 1;
@@ -4491,18 +4498,33 @@ fn fx_matrix(
     use_theme_colors: bool,
     effect: &str,
 ) -> Result<()> {
-    use rand::Rng;
+    use rand::SeedableRng;
+    if let Some(raw)=std::env::var_os("TTFX_BG_NATIVE_SEED") {
+        let seed=raw.to_string_lossy().parse::<u64>()
+            .map_err(|_|anyhow::anyhow!("TTFX_BG_NATIVE_SEED debe ser un entero u64"))?;
+        let mut rng=rand::rngs::StdRng::seed_from_u64(seed);
+        fx_matrix_with_rng(scr,palette,intensity,audio,rain,use_theme_colors,effect,&mut rng,Some(seed))
+    } else {
+        let mut rng=rand::thread_rng();
+        fx_matrix_with_rng(scr,palette,intensity,audio,rain,use_theme_colors,effect,&mut rng,None)
+    }
+}
+
+fn fx_matrix_with_rng<R: rand::Rng + ?Sized>(
+    scr:&mut Screen, palette:&[String], intensity:i64, audio:&AudioState,
+    rain:bool, use_theme_colors:bool, effect:&str, rng:&mut R, native_seed:Option<u64>,
+) -> Result<()> {
     let mut native_probe = if scr.direct_snapshot.is_some() {
         producer_probe::ProducerProbe::open()?
     } else { None };
     if let Some(probe) = native_probe.as_mut() {
         probe.record(serde_json::json!({"event":"producer_route", "route":"native_matrix",
-            "effect":effect, "uses_asm":false, "rng":"rand::thread_rng", "seed_controlled":false,
+            "effect":effect, "uses_asm":false, "rng":if native_seed.is_some(){"StdRng"}else{"rand::thread_rng"}, "seed_controlled":native_seed.is_some(), "native_seed":native_seed,
+            "native_swap":scr.native_swap,
             "asm_seed_ignored":std::env::var_os("TTFX_BG_CADENCE_SEED").is_some(),
             "asm_timing_ignored":std::env::var("TTFX_ASM_TIMING").as_deref()==Ok("1"),
             "cols":scr.cols, "rows":scr.rows, "base_delay_ms":40}));
     }
-    let mut rng = rand::thread_rng();
     let chars: Vec<char> = if rain {
         "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿ0123456789".chars().collect()
     } else {
@@ -6174,7 +6196,7 @@ mod native_matrix_diagnostic_tests {
         let status=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","native_matrix_diagnostic_tests::native_probe_child","--ignored"])
             .env("TTFX_BG_PRODUCER_LOG",dir.join("trace"))
-            .env("TTFX_BG_CADENCE_SEED","12345").env("TTFX_ASM_TIMING","1")
+            .env("TTFX_BG_CADENCE_SEED","12345").env("TTFX_ASM_TIMING","1").env_remove("TTFX_BG_NATIVE_SEED")
             .status().unwrap();
         assert!(status.success());
         let file=std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
@@ -6189,5 +6211,34 @@ mod native_matrix_diagnostic_tests {
             assert!(e["generation"].as_u64().unwrap()>0);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_swap_equivalence_tests {
+    use super::*;
+    use rand::SeedableRng;
+    #[test]
+    fn seeded_native_matrix_publications_are_identical_for_clone_and_swap() {
+        fn run(swap:bool)->Vec<Vec<DirectCell>> {
+            let slot=Arc::new(std::sync::Mutex::new(Vec::new()));
+            let generation=Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut screen=Screen::new_direct(237,61,slot,generation.clone(),stop);
+            screen.native_swap=swap;
+            INTENSITY_WATCHER.with(|w| *w.borrow_mut()=IntensityWatcher {last_check:std::time::Instant::now()+Duration::from_secs(60),intensity:5});
+            SPEED_WATCHER.with(|w| *w.borrow_mut()=SpeedWatcher {last_check:std::time::Instant::now()+Duration::from_secs(60),speed:5});
+            native_publication::capture_begin(24);
+            let mut rng=rand::rngs::StdRng::seed_from_u64(12345);
+            let audio=AudioState::start(false);
+            fx_matrix_with_rng(&mut screen,&hardcoded_palette("matrix"),5,&audio,false,false,"matrix",&mut rng,Some(12345)).unwrap();
+            let frames=native_publication::capture_finish();
+            assert_eq!(generation.load(Ordering::Acquire),24);
+            frames
+        }
+        let a=run(false); let b=run(true);
+        assert_eq!(a,b); // Campos, orden, caracteres, RGB, ocupación y número de pasos.
+        assert_eq!(a.len(),24);
+        assert!(a.windows(2).any(|w|w[0]!=w[1]));
     }
 }
