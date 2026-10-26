@@ -76,6 +76,10 @@ ttfx_asm_run:
     mov     rdx, [rcx + rax + 8]
     mov     [effect_next_frame], rdx
     call    load_request
+    mov     rax, [request]
+    mov     rax, [rax + RQ_FLAGS]
+    and     rax, 1 << FL_DIRECT_TIMING                ; diagnóstico optativo, sin cambiar ABI
+    mov     [cfg_diagnostic], rax
     mov     rdi, 1 << 38
     call    reserve
     mov     [arena_ptr], rax
@@ -349,6 +353,11 @@ run_direct_frames:
 .frame:
     call    check_stop
     jnz     .done
+    cmp     qword [cfg_diagnostic], 0
+    je      .without_start_time
+    call    monotonic_ns
+    mov     [diag_frame_start], rax
+.without_start_time:
     call    next_frame                ; preserve ASM effect audio and pacing
     test    eax, eax
     jz      .done
@@ -356,6 +365,15 @@ run_direct_frames:
     call    check_stop
     jnz     .done
     call    visual_export_audio       ; current-frame ASM color, including cached scenes
+    cmp     qword [cfg_diagnostic], 0
+    je      .without_export_time
+    push    rcx                       ; preservar grid/pool del callback
+    push    r8
+    call    monotonic_ns
+    mov     [diag_export_end], rax
+    pop     r8
+    pop     rcx
+.without_export_time:
     mov     rax, [request]
     mov     rdi, [rax + RQ_DIRECT_CTX]
     mov     r10, [rax + RQ_DIRECT_EMIT]
@@ -746,16 +764,43 @@ enforce_framerate:
     div     rcx
     push    rax                         ; frame delay in ns
     call    monotonic_ns
+    cmp     qword [cfg_diagnostic], 0
+    je      .without_enter_time
+    mov     [diag_wait_enter], rax
+    mov     qword [diag_wait_requested], 0
+.without_enter_time:
     sub     rax, [last_frame_ns]
     pop     rdi
     cmp     rax, rdi
     jge     .stamp
     sub     rdi, rax
+    cmp     qword [cfg_diagnostic], 0
+    je      .without_requested_time
+    mov     [diag_wait_requested], rdi
+.without_requested_time:
     call    sleep_ns
 .stamp:
     call    monotonic_ns
     mov     [last_frame_ns], rax
+    cmp     qword [cfg_diagnostic], 0
+    je      .done
+    mov     [diag_wait_wake], rax
 .done:
+    ret
+
+; Getter sólo desde el callback síncrono que posee el engine lock.
+EXPORT ttfx_asm_direct_timing
+ttfx_asm_direct_timing:
+    mov     rax, [diag_frame_start]
+    mov     [rdi], rax
+    mov     rax, [diag_wait_enter]
+    mov     [rdi + 8], rax
+    mov     rax, [diag_wait_requested]
+    mov     [rdi + 16], rax
+    mov     rax, [diag_wait_wake]
+    mov     [rdi + 24], rax
+    mov     rax, [diag_export_end]
+    mov     [rdi + 32], rax
     ret
 
 %include "rt/sys.asm"
@@ -809,6 +854,12 @@ clock_now:          resq 1
 clock_dt:           resq 1
 cfg_tab_width:      resq 1
 cfg_frame_rate:     resq 1
+cfg_diagnostic:     resq 1
+diag_frame_start:   resq 1
+diag_wait_enter:    resq 1
+diag_wait_requested: resq 1
+diag_wait_wake:     resq 1
+diag_export_end:    resq 1
 cfg_canvas_width:   resq 1
 cfg_canvas_height:  resq 1
 cfg_anchor_canvas:  resq 1

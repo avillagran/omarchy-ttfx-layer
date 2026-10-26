@@ -56,6 +56,8 @@ static SCRIPT_FRAME: AtomicU64 = AtomicU64::new(0);
 // any tier while another run may still be using a borrowed frame or pool.
 static ENGINE_RUN_LOCK: Mutex<()> = Mutex::new(());
 thread_local! {
+    #[cfg(target_arch = "x86_64")]
+    static ACTIVE_DIRECT_TIMING: Cell<Option<unsafe extern "C" fn(*mut u64)>> = const { Cell::new(None) };
     static ENGINE_RUN_ACTIVE: Cell<bool> = const { Cell::new(false) };
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     static ACTIVE_AUDIO_STATS: Cell<Option<unsafe extern "C" fn(*mut u64)>> = const { Cell::new(None) };
@@ -66,6 +68,8 @@ struct ActiveRun;
 impl Drop for ActiveRun {
     fn drop(&mut self) {
         ENGINE_RUN_ACTIVE.with(|active| active.set(false));
+        #[cfg(target_arch = "x86_64")]
+        ACTIVE_DIRECT_TIMING.with(|active| active.set(None));
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         ACTIVE_AUDIO_STATS.with(|active| active.set(None));
     }
@@ -159,6 +163,7 @@ const FL_NO_RESTORE: u64 = 1 << 6;
 const FL_PARITY_DUMP: u64 = 1 << 7;
 const FL_VIRTUAL_CLOCK: u64 = 1 << 8;
 const FL_TTY_OUTPUT: u64 = 1 << 9;
+const FL_DIRECT_TIMING: u64 = 1 << 10;
 
 const OUT_DECLINED: i64 = 0;
 const OUT_COMPLETE: i64 = 1;
@@ -195,10 +200,12 @@ struct Engine {
     run: unsafe extern "C" fn(*mut Request) -> i64,
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     audio_stats: unsafe extern "C" fn(*mut u64),
+    #[cfg(target_arch = "x86_64")]
+    direct_timing: unsafe extern "C" fn(*mut u64),
 }
 
 macro_rules! tiers {
-    ($($tier:literal, $cfg:literal => $supported:ident, $run:ident, $stats:ident;)*) => {
+    ($($tier:literal, $cfg:literal => $supported:ident, $run:ident, $stats:ident, $timing:ident;)*) => {
         $(
             #[cfg(ttfx_asm_tier = $cfg)]
             extern "C" {
@@ -206,6 +213,8 @@ macro_rules! tiers {
                 fn $run(request: *mut Request) -> i64;
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 fn $stats(out: *mut u64);
+                #[cfg(target_arch = "x86_64")]
+                fn $timing(out: *mut u64);
             }
         )*
 
@@ -215,7 +224,8 @@ macro_rules! tiers {
                 #[cfg(ttfx_asm_tier = $cfg)]
                 if tier == $tier {
                     return Some(Engine { tier, effect_supported: $supported, run: $run,
-                        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] audio_stats: $stats });
+                        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] audio_stats: $stats,
+                        #[cfg(target_arch = "x86_64")] direct_timing: $timing });
                 }
             )*
             None
@@ -224,10 +234,10 @@ macro_rules! tiers {
 }
 
 tiers! {
-    1, "1" => ttfx_asm_effect_supported_v1, ttfx_asm_run_v1, ttfx_asm_audio_export_stats_v1;
-    2, "2" => ttfx_asm_effect_supported_v2, ttfx_asm_run_v2, ttfx_asm_audio_export_stats_v2;
-    3, "3" => ttfx_asm_effect_supported_v3, ttfx_asm_run_v3, ttfx_asm_audio_export_stats_v3;
-    4, "4" => ttfx_asm_effect_supported_v4, ttfx_asm_run_v4, ttfx_asm_audio_export_stats_v4;
+    1, "1" => ttfx_asm_effect_supported_v1, ttfx_asm_run_v1, ttfx_asm_audio_export_stats_v1, ttfx_asm_direct_timing_v1;
+    2, "2" => ttfx_asm_effect_supported_v2, ttfx_asm_run_v2, ttfx_asm_audio_export_stats_v2, ttfx_asm_direct_timing_v2;
+    3, "3" => ttfx_asm_effect_supported_v3, ttfx_asm_run_v3, ttfx_asm_audio_export_stats_v3, ttfx_asm_direct_timing_v3;
+    4, "4" => ttfx_asm_effect_supported_v4, ttfx_asm_run_v4, ttfx_asm_audio_export_stats_v4, ttfx_asm_direct_timing_v4;
 }
 
 /// The engine to run: the tier `TTFX_ASM_TIER` names (1-4, at most the
@@ -357,6 +367,8 @@ fn offer_with_hook_locked(
         (run.parity_dump, FL_PARITY_DUMP),
         (run.virtual_clock, FL_VIRTUAL_CLOCK),
         (run.tty_output, FL_TTY_OUTPUT),
+        (cfg!(target_arch = "x86_64") && direct.is_some()
+            && std::env::var("TTFX_ASM_TIMING").as_deref() == Ok("1"), FL_DIRECT_TIMING),
     ]
     .iter()
     .filter(|(on, _)| *on)
@@ -414,6 +426,8 @@ fn offer_with_hook_locked(
     // stop context) outlive the call; the engine writes only the out fields.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ACTIVE_AUDIO_STATS.with(|active| active.set(Some(engine.audio_stats)));
+    #[cfg(target_arch = "x86_64")]
+    ACTIVE_DIRECT_TIMING.with(|active| active.set(Some(engine.direct_timing)));
     let outcome = unsafe { (engine.run)(&mut *request) };
     drop(words);
     if outcome == OUT_DECLINED {
@@ -592,6 +606,17 @@ pub fn direct_audio_export_stats() -> Option<[u64; 3]> {
         let mut out=[0u64;3];
         // SAFETY: same-thread active run holds the engine lock; getter only
         // copies that tier's numeric counters to this writable 24-byte array.
+        unsafe { read(out.as_mut_ptr()); }
+        out
+    }))
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn direct_timing_snapshot() -> Option<[u64; 5]> {
+    if !ENGINE_RUN_ACTIVE.with(Cell::get) { return None; }
+    ACTIVE_DIRECT_TIMING.with(|active| active.get().map(|read| {
+        let mut out = [0; 5];
+        // Mismo hilo, dentro del callback síncrono; el lock excluye otros runs.
         unsafe { read(out.as_mut_ptr()); }
         out
     }))

@@ -182,6 +182,7 @@ global %1
 %define FL_PARITY_DUMP      7
 %define FL_VIRTUAL_CLOCK    8
 %define FL_TTY_OUTPUT       9
+%define FL_DIRECT_TIMING    10          ; observación optativa x86, sin alterar pacing
 
 ; ttfx_asm_run outcomes; negative values are -errno from a failed write
 %define OUT_DECLINED        0

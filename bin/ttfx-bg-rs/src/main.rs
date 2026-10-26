@@ -28,6 +28,7 @@ mod gpu_grid;
 mod occlusion;
 mod wl_layer;
 mod presentation_probe;
+mod producer_probe;
 mod pixel_paintable;
 use ttfx_bg_rs::opaque_bgra;
 mod wordmark;
@@ -3637,6 +3638,7 @@ struct AsmThemeSink<'a> {
     use_theme_colors: bool,
     /// Paces the engine to the live frame-rate ceiling; see `pace_to_cap`.
     next_due: Option<std::time::Instant>,
+    producer_probe: Option<producer_probe::ProducerProbe>,
 }
 
 /// The assembly engine paces itself to the frame rate fixed when the run
@@ -3675,8 +3677,15 @@ unsafe extern "C" fn asm_emit_themed_frame(
     // value exclusively until run_direct returns. It cannot escape to GTK.
     let themed = unsafe { &mut *(ctx as *mut AsmThemeSink<'_>) };
     fps_governor::note_tick();
-    themed.next_due = pace_to_cap(max_fps(), themed.next_due, std::time::Instant::now());
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let diagnostic = themed.producer_probe.as_ref().map(|_| {
+        (producer_probe::monotonic_ns(), producer_probe::thread_cpu_ns(), ttfx::asm::direct_timing_snapshot())
+    });
+    let cap = max_fps();
+    let now = std::time::Instant::now();
+    let requested = diagnostic.as_ref().map(|_| producer_probe::requested_wait_ns(cap, themed.next_due, now));
+    themed.next_due = pace_to_cap(cap, themed.next_due, now);
+    let wait_end = diagnostic.as_ref().map(|_| producer_probe::monotonic_ns());
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         asm_emit_themed_frame_inner(themed, cols, rows, grid, pool)
     })) {
         Ok(result) => result,
@@ -3684,7 +3693,22 @@ unsafe extern "C" fn asm_emit_themed_frame(
             themed.sink.error = Some("assembly themed callback panicked");
             1
         }
+    };
+    if let (Some(probe), Some((enter, cpu_enter, asm))) = (themed.producer_probe.as_mut(), diagnostic) {
+        probe.sequence += 1;
+        let enabled = asm.filter(|v| v[0] != 0 && v[1] >= v[0] && v[3] >= v[1] && v[4] >= v[3]);
+        probe.record(serde_json::json!({"event":"producer_frame", "sequence":probe.sequence,
+            "generation":themed.sink.generation.load(std::sync::atomic::Ordering::Acquire),
+            "callback_enter_ns":enter, "callback_cpu_enter_ns":cpu_enter,
+            "cap":cap, "rust_wait_requested_ns":requested, "rust_wait_end_ns":wait_end,
+            "asm_raw_ns":enabled,
+            "asm_compute_ns":enabled.map(|v|v[1]-v[0]),
+            "asm_wait_requested_ns":enabled.map(|v|v[2]),
+            "asm_wait_elapsed_ns":enabled.map(|v|v[3]-v[1]),
+            "asm_export_ns":enabled.map(|v|v[4]-v[3]),
+            "callback_result":result}));
     }
+    result
 }
 
 fn asm_emit_themed_frame_inner(
@@ -3768,6 +3792,7 @@ fn run_ttfx_asm_direct(
         theme_watcher: ThemeWatcher::new(),
         use_theme_colors: cfg.use_theme_colors,
         next_due: None,
+        producer_probe: producer_probe::ProducerProbe::open()?,
     };
     while !themed.sink.stop.load(Ordering::Relaxed) {
         let hook = DirectFrameHook {

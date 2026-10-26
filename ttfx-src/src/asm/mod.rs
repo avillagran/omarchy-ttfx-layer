@@ -181,3 +181,12 @@ pub fn direct_audio_export_stats() -> Option<[u64; 3]> {
     #[cfg(not(all(ttfx_asm, any(target_arch = "x86_64", target_arch = "aarch64"))))]
     { None }
 }
+
+/// Diagnóstico x86 optativo: start, wait-enter, requested, wake, export-end (ns).
+/// Sólo válido dentro del callback síncrono; otras arquitecturas dan None.
+pub fn direct_timing_snapshot() -> Option<[u64; 5]> {
+    #[cfg(all(ttfx_asm, target_arch = "x86_64"))]
+    { ffi::direct_timing_snapshot() }
+    #[cfg(not(all(ttfx_asm, target_arch = "x86_64")))]
+    { None }
+}
