@@ -89,3 +89,11 @@ Existing historical ARM parallel F_GETFD failures remain unresolved; no wakeup
 code is changed. Source-level default pacing is preserved, but removing hidden
 plugin speed/intensity inputs can intentionally change sessions that previously
 inherited conflicting state; do not claim old CPU/cadence results apply unchanged.
+
+## Recorded results
+
+The pending review status above describes immutable runtime snapshot e918c256.
+See [standalone-config-validation.md](standalone-config-validation.md) for the
+separate x86 passes, ARM serial/EGL/build passes and unresolved ARM normal-parallel
+SIGSEGV. The failed parallel gate remains failed; no two-architecture clean release
+is claimed. This link is documentation only.
