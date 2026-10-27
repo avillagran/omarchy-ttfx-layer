@@ -23,6 +23,7 @@ mod frame_cadence;
 mod frame_handoff;
 mod fps_governor;
 mod standalone;
+mod standalone_config;
 mod frame_wakeup;
 mod gpu_grid;
 mod render_profile;
@@ -533,6 +534,13 @@ thread_local! {
 }
 
 fn read_config() -> Config {
+    // Standalone workers own a fixed config and their stop flag. This early
+    // return covers every indirect watcher/audio/completion read without
+    // touching controller state or its LAST_GOOD_CONFIG cache.
+    if let Some(config) = standalone_config::current() {
+        return config;
+    }
+    #[cfg(test)] standalone_config::record_plugin_read();
     let text = std::fs::read_to_string(config_path())
         .or_else(|_| std::fs::read_to_string(legacy_config_path()));
     // Empty or brace-less content = torn write window (or a corrupt file); never

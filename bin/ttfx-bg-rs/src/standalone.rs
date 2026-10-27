@@ -196,10 +196,23 @@ fn wait_until(duration: Duration, done: impl Fn() -> bool) {
 /// Printed by `--probe`, so callers can tell this build from older ones that
 /// would start the plugin controller instead.
 pub const PROBE: &str = "omarchy-ttfx-layer 1";
+pub const CAPABILITIES: &str = "omarchy-ttfx-layer capabilities: text-file-v1 standalone-config-v1";
+
+fn startup_response(args: &[String]) -> Option<&'static str> {
+    // Must win over --probe: old binaries safely return PROBE for the combined
+    // --standalone --probe --capabilities handshake, without starting a layer.
+    if args.iter().any(|arg| arg == "--capabilities") {
+        Some(CAPABILITIES)
+    } else if args.iter().any(|arg| arg == "--probe") {
+        Some(PROBE)
+    } else {
+        None
+    }
+}
 
 pub fn run(args: &[String]) -> Result<()> {
-    if args.iter().any(|a| a == "--probe") {
-        println!("{PROBE}");
+    if let Some(response) = startup_response(args) {
+        println!("{response}");
         return Ok(());
     }
     let opts = parse(args)?;
@@ -284,12 +297,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let (cfg, effect, snapshot, generation, stop, wakeup) =
                 (cfg.clone(), effect.clone(), snapshot.clone(), generation.clone(), producer_stop.clone(), wakeup.clone());
             thread::Builder::new().name(format!("ttfx-gpu-{effect}")).spawn(move || {
-                frame_wakeup::set_current(Some(wakeup));
-                let result = run_direct_render_with_input(
-                    &cfg, &effect, cols, rows, false, cell_aspect, snapshot, generation, stop, literal_text.as_deref(),
-                );
-                frame_wakeup::set_current(None);
-                result
+                run_producer(&cfg, &effect, cols, rows, cell_aspect, snapshot, generation, stop, wakeup, literal_text.as_deref())
             })?
         };
         log_dbg(&format!("omarchy-ttfx-layer: {effect}"));
@@ -320,12 +328,151 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 }
 
+// Shared by real rotation workers and wiring tests. Policy is installed before
+// AudioState, native watchers or ASM callbacks can consult read_config.
+fn run_producer(
+    cfg: &Config, effect: &str, cols: usize, rows: usize, cell_aspect: f32,
+    snapshot: Arc<Mutex<Vec<DirectCell>>>, generation: Arc<AtomicU64>, stop: Arc<AtomicBool>,
+    wakeup: Arc<frame_wakeup::FrameWakeup>, literal_input: Option<&str>,
+) -> Result<()> {
+    let _policy = crate::standalone_config::enter(cfg.clone(), stop.clone());
+    frame_wakeup::set_current(Some(wakeup));
+    let result = run_direct_render_with_input(cfg, effect, cols, rows, false, cell_aspect,
+        snapshot, generation, stop, literal_input);
+    frame_wakeup::set_current(None);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
         std::iter::once("omarchy-ttfx-layer").chain(list.iter().copied()).map(String::from).collect()
+    }
+
+    #[test]
+    fn capabilities_precede_probe_and_all_startup_work() {
+        assert_eq!(CAPABILITIES, "omarchy-ttfx-layer capabilities: text-file-v1 standalone-config-v1");
+        for flags in [vec!["--capabilities"], vec!["--standalone", "--probe", "--capabilities"],
+                      vec!["--capabilities", "--probe"], vec!["--probe", "--text-file", "/no/such/input", "--capabilities"]] {
+            assert_eq!(startup_response(&args(&flags)), Some(CAPABILITIES));
+        }
+        assert_eq!(startup_response(&args(&["--probe"])), Some("omarchy-ttfx-layer 1"));
+        assert_eq!(startup_response(&args(&["--standalone", "--probe"])), Some(PROBE));
+        assert_eq!(startup_response(&args(&[])), None);
+    }
+
+    // Run only via the parent test in a child with an isolated HOME. This never
+    // reads/writes the user's real plugin state or theme.
+    #[test]
+    #[ignore = "isolated HOME helper for standalone_config_ignores_plugin_state"]
+    fn fixed_config_policy_child() {
+        use crate::{read_config, standalone_config, IntensityWatcher, SpeedWatcher, LiveReactivity,
+            AsmAudio, AudioState, asm_audio_poll, asm_audio_params};
+        let kind = std::env::var("TTFX_CONFIG_FIXTURE").unwrap();
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        assert_eq!(crate::config_path(), home.join(".local/state/omarchy/audio-background/state.json"));
+        assert_eq!(crate::legacy_config_path(), home.join(".config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"));
+        assert!(standalone_config::current().is_none());
+        // No policy: controller/default-path behavior stays live and unchanged.
+        let controller = read_config();
+        if kind == "modern" || kind == "legacy" {
+            assert_eq!((controller.running, controller.intensity, controller.speed, controller.reactivity), (false, 0, 100, 5));
+        } else {
+            assert_eq!((controller.intensity, controller.speed, controller.reactivity), (5, 5, 2));
+        }
+        let reads = standalone_config::plugin_reads();
+        assert!(reads > 0);
+        let cfg = Config { audio: false, ..Config::default() };
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let _policy = standalone_config::enter(cfg.clone(), stop.clone());
+            let due = Instant::now() - Duration::from_secs(1);
+            let mut intensity = IntensityWatcher { last_check: due, intensity: -1 };
+            let mut speed = SpeedWatcher { last_check: due, speed: -1 };
+            assert_eq!(intensity.current(9), 5);
+            assert_eq!(speed.current(99), 5);
+            let audio = AsmAudio { state: &AudioState::start(false), enabled: false,
+                reactivity: LiveReactivity::new(9) };
+            audio.reactivity.checked.set(due);
+            let ctx = (&audio as *const AsmAudio<'_>).cast_mut().cast();
+            assert_eq!(asm_audio_poll(ctx), 0);
+            assert_eq!(audio.reactivity.value.get(), 2);
+            audio.reactivity.checked.set(due);
+            let mut params = [0f32; 16];
+            assert_eq!(asm_audio_params(ctx, params.as_mut_ptr()), 0);
+            assert_eq!(audio.reactivity.value.get(), 2);
+            // Omarchy theme data is intentionally still read from its own paths.
+            assert!(crate::read_theme_colors().iter().any(|(name, value)| name == "background" && value == "#112233"));
+            stop.store(true, Ordering::Release);
+            assert!(!read_config().running);
+        }
+        assert_eq!(standalone_config::plugin_reads(), reads);
+        assert!(standalone_config::current().is_none());
+        assert!(ttfx::asm::tier() > 0, "real native/ASM policy gate needs ASM");
+        let slot = Arc::new(Mutex::new(vec![]));
+        let generation = Arc::new(AtomicU64::new(0));
+        // Same actual producer launch used by runtime rotations, same slot;
+        // thread policies must neither leak nor disappear in ASM callbacks.
+        for effect in ["matrix", "rings", "matrix"] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let wakeup = Arc::new(frame_wakeup::FrameWakeup::new(stop.clone()).unwrap());
+            let (worker_cfg, worker_slot, worker_gen, worker_stop) = (cfg.clone(), slot.clone(), generation.clone(), stop.clone());
+            let before = generation.load(Ordering::Acquire);
+            let worker = thread::spawn(move || {
+                let result = run_producer(&worker_cfg, effect, 80, 24, 2., worker_slot, worker_gen, worker_stop, wakeup, Some("  ASCII\n /__\\  "));
+                assert_eq!(standalone_config::plugin_reads(), 0, "{effect} read plugin state");
+                assert!(standalone_config::current().is_none(), "policy leaked after producer return");
+                result
+            });
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(4) && !worker.is_finished() {
+                if generation.load(Ordering::Acquire) >= before + 3 && start.elapsed() >= Duration::from_millis(350) { break; }
+                thread::sleep(Duration::from_millis(2));
+            }
+            let last = { let _guard = slot.lock().unwrap(); stop.store(true, Ordering::Release); generation.load(Ordering::Acquire) };
+            worker.join().unwrap().unwrap();
+            assert!(last >= before + 3, "no real {effect} publications");
+            assert_eq!(generation.load(Ordering::Acquire), last, "publication after stop");
+            eprintln!("STANDALONE_FIXED_POLICY effect={effect} fixture={kind} generation={last} plugin_reads=0");
+        }
+        // The parent/controller thread still follows its original path.
+        read_config();
+        assert_eq!(standalone_config::plugin_reads(), reads + 1);
+    }
+
+    #[test]
+    fn standalone_config_ignores_plugin_state() {
+        for kind in ["modern", "legacy", "malformed", "missing"] {
+            let root = std::env::temp_dir().join(format!("ttfx-config-policy-{}-{kind}-{}", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir_all(&root).unwrap();
+            let state = match kind {
+                "legacy" => root.join(".config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"),
+                _ => root.join(".local/state/omarchy/audio-background/state.json"),
+            };
+            if kind != "missing" {
+                std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+                std::fs::write(&state, if kind == "malformed" { "" } else {
+                    r#"{"running":false,"intensity":0,"speed":100,"reactivity":5,"use_theme_colors":false}"#
+                }).unwrap();
+            }
+            let theme = root.join(".local/state/omarchy/current/theme.name");
+            std::fs::create_dir_all(theme.parent().unwrap()).unwrap();
+            std::fs::write(theme, "test-theme\n").unwrap();
+            let colors = root.join("omarchy/themes/test-theme/colors.toml");
+            std::fs::create_dir_all(colors.parent().unwrap()).unwrap();
+            std::fs::write(colors, "background = \"#112233\"\nforeground = \"#aabbcc\"\n").unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "standalone::tests::fixed_config_policy_child", "--ignored", "--nocapture"])
+                .env("HOME", &root).env("OMARCHY_PATH", root.join("omarchy")).env("TTFX_CONFIG_FIXTURE", kind)
+                .env_remove("TTFX_BG_PRODUCER_LOG").env_remove("TTFX_ASM_TIMING")
+                .env_remove("TTFX_BG_PRESENTATION_LOG").status().unwrap();
+            // Remove only our isolated fixture; the user's actual HOME is untouched.
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(status.success(), "policy fixture {kind} failed");
+        }
     }
 
     struct InputFile(std::path::PathBuf);

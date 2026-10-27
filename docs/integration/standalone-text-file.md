@@ -85,3 +85,12 @@ Cover all four reads, not just speed/intensity. Test conflicting plugin state,
 absent/malformed state, rotation and stop, and prove no plugin reads for the fixed
 policy. Such a change can alter cadence/resources and requires its own validation;
 it is deliberately excluded from this branding-only commit and v1 perf claims.
+
+
+## Configuration-isolation descendant
+
+The original text-file-only snapshot above is d8d5146. Its plugin-coupling
+limitation is historical and remains true for that frozen snapshot. The separate
+standalone-config descendant implements the scoped policy; see
+[standalone-config.md](standalone-config.md) for its contract and independent
+gates. No v1 performance claim transfers automatically to configuration changes.

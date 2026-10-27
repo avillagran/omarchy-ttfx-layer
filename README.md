@@ -124,17 +124,26 @@ there is no silent substitution. Without either option the old behavior remains.
 No default branding path is selected by the renderer: the Omarchy/source launcher
 supplies it. The file is not watched or reread during rotation; restart to reload.
 
-Known pre-existing integration limitation: the standalone producer's live
-intensity/speed watchers still read the audio-background state every250ms,
-reactivity hooks also read it (including before the audio-enabled check), and
-ASM completion consults its `running` flag. State is read from
-`~/.local/state/omarchy/audio-background/state.json` with legacy fallback under
-`~/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/`.
-This branding-only change does not isolate those preferences and does not prove
-that standalone configuration is fully independent of the plugin. That requires
-a separate policy change and regression/temporal validation; it blocks claiming
-completed Omarchy configuration integration. No pacing/profile/default change
-or new plugin preference is introduced here.
+Standalone producers now keep their startup config fixed: intensity/speed/
+reactivity do not read the audio-background plugin, and liveness follows their
+stop flag rather than the plugin's running flag. Controller workers retain live
+plugin settings. Omarchy theme colors still use the existing Omarchy theme paths.
+This configuration correction is separate from the measured v1 optimization;
+no new performance result is claimed.
+
+For safe feature detection, invoke:
+
+```sh
+omarchy-ttfx-layer --standalone --probe --capabilities
+```
+
+This build prints exactly
+`omarchy-ttfx-layer capabilities: text-file-v1 standalone-config-v1` and exits
+before file/monitor/audio/Wayland startup. Capabilities takes priority over probe.
+Older builds with probe support safely print `omarchy-ttfx-layer 1` for that
+combined handshake; that response is not feature support. Compare the full line
+with a timeout; do not use `--capabilities` alone to test an unknown old build.
+`--probe` alone still prints its original line.
 
 ## Files
 
