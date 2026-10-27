@@ -87,7 +87,7 @@ Runtime knobs (set in `bin/ttfx-bg-launch.sh`): `TTFX_BG_MAX_FPS` (`auto` by def
 
 The same binary runs on its own as `omarchy-ttfx-layer` (a symlink or copy
 with that name, or `--standalone`): one output, its own layer surface, no
-plugin state, no controller lock. omarchy-bg-live's `ttfx` source uses it to
+controller lock. omarchy-bg-live's `ttfx` source uses it to
 show these effects as the background or as the screensaver.
 
 ```sh
@@ -101,6 +101,40 @@ the `OMARCHY_BG_LIVE_*` variables omarchy-bg-live sets. `--probe` prints
 ones. With `--fps auto` the ceiling also respects `TTFX_BG_GPU_BUDGET`
 (default 0.30) where the kernel reports GPU load (Intel RC6, AMD
 `gpu_busy_percent`).
+
+### Literal Omarchy branding file (standalone only)
+
+```sh
+omarchy-ttfx-layer --output eDP-1 --layer overlay --keyboard exclusive \
+  --effects decrypt,rings --text-file "$HOME/.config/omarchy/branding/screensaver.txt"
+```
+
+`--text-file` reads a UTF-8 file once, before renderer startup, and passes its
+contents directly to the existing ASM input parser. It preserves spaces, line
+breaks and UTF-8 bytes without wordmark expansion or per-line recentering. The
+engine's existing ANSI parsing, anchoring, clipping and effect behavior remain.
+Even a file containing only `OMARCHY` is literal. An empty file stays empty.
+Native Matrix/rain and other non-text effects do not animate this input.
+
+Precedence is independent of argument order: explicit `--text` wins and retains
+its existing canvas/wordmark behavior; an ignored `--text-file` is not read.
+Otherwise `--text-file` wins over the normal `OMARCHY` default. A missing argument,
+unreadable file or invalid UTF-8 produces a startup error naming the flag/path;
+there is no silent substitution. Without either option the old behavior remains.
+No default branding path is selected by the renderer: the Omarchy/source launcher
+supplies it. The file is not watched or reread during rotation; restart to reload.
+
+Known pre-existing integration limitation: the standalone producer's live
+intensity/speed watchers still read the audio-background state every250ms,
+reactivity hooks also read it (including before the audio-enabled check), and
+ASM completion consults its `running` flag. State is read from
+`~/.local/state/omarchy/audio-background/state.json` with legacy fallback under
+`~/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/`.
+This branding-only change does not isolate those preferences and does not prove
+that standalone configuration is fully independent of the plugin. That requires
+a separate policy change and regression/temporal validation; it blocks claiming
+completed Omarchy configuration integration. No pacing/profile/default change
+or new plugin preference is introduced here.
 
 ## Files
 

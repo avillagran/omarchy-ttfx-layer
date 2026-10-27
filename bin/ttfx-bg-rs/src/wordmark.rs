@@ -58,6 +58,16 @@ pub fn wordmark_input(text: &str, cols: usize, rows: usize, style: &str, aspect:
     out.join("\n")
 }
 
+/// Standalone file input bypasses wordmark expansion AND per-line centering.
+/// Keep every UTF-8 byte for the engine's existing input parser. Normal --text
+/// and all controller routes retain canvas_input exactly as before.
+pub fn direct_input<'a>(literal: Option<&'a str>, text: &str, cols: usize, rows: usize, style: &str, aspect: f32) -> std::borrow::Cow<'a, str> {
+    match literal {
+        Some(input) => std::borrow::Cow::Borrowed(input),
+        None => std::borrow::Cow::Owned(canvas_input(text, cols, rows, style, aspect)),
+    }
+}
+
 pub fn canvas_input(text: &str, cols: usize, rows: usize, style: &str, aspect: f32) -> String {
     let mut canvas = vec![vec![' '; cols]; rows];
     if text.trim().eq_ignore_ascii_case("OMARCHY") && cols > 0 && rows > 0 {

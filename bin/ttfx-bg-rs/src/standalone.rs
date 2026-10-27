@@ -11,7 +11,7 @@
 //! ```text
 //! omarchy-ttfx-layer --output <name> --layer bottom|overlay --keyboard none|exclusive
 //!                    [--effects a,b,c] [--rotate <seconds>] [--fps auto|<n>]
-//!                    [--text <wordmark>] [--audio] [--namespace <ns>]
+//!                    [--text <wordmark> | --text-file <UTF-8 path>] [--audio] [--namespace <ns>]
 //!                    [--width <px> --height <px> --scale <n>] [--resolution <1-8>]
 //! ```
 //!
@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use gtk4::pango::{self, prelude::FontMapExt};
 
 use crate::{
-    fps_governor, frame_wakeup, is_valid_effect, log_dbg, measured_grid, run_direct_render, wl_layer,
+    fps_governor, frame_wakeup, is_valid_effect, log_dbg, measured_grid, run_direct_render_with_input, wl_layer,
     Config, DirectCell,
 };
 
@@ -59,6 +59,8 @@ pub struct Options {
     pub rotate: Duration,
     pub fps: Option<String>,
     pub text: String,
+    // Literal file contents, read once before starting any renderer threads.
+    pub literal_text: Option<String>,
     pub audio: bool,
     pub namespace: String,
     pub size: Option<(i32, i32, f64)>,
@@ -76,7 +78,25 @@ fn env_or(key: &str, flag: Option<&str>) -> Option<String> {
     flag.map(str::to_string).or_else(|| std::env::var(key).ok().filter(|v| !v.is_empty()))
 }
 
+// Explicit --text preserves its legacy canvas behavior and wins regardless of
+// argv order. An ignored file is not opened. No implicit plugin/config lookup.
+fn text_input(args: &[String]) -> Result<(String, Option<String>)> {
+    if let Some(text) = value(args, "--text") {
+        return Ok((text.to_string(), None));
+    }
+    let literal = if let Some(index) = args.iter().position(|arg| arg == "--text-file") {
+        let path = args.get(index + 1).filter(|path| !path.is_empty() && !path.starts_with("--"))
+            .ok_or_else(|| anyhow!("--text-file requires a UTF-8 file path"))?;
+        Some(std::fs::read_to_string(path)
+            .with_context(|| format!("--text-file: cannot read UTF-8 file {path:?}"))?)
+    } else {
+        None
+    };
+    Ok(("OMARCHY".into(), literal))
+}
+
 pub fn parse(args: &[String]) -> Result<Options> {
+    let (text, literal_text) = text_input(args)?;
     let layer = env_or("OMARCHY_BG_LIVE_LAYER", value(args, "--layer")).unwrap_or_else(|| "bottom".into());
     let overlay = match layer.as_str() {
         "bottom" => false,
@@ -122,7 +142,8 @@ pub fn parse(args: &[String]) -> Result<Options> {
         effects,
         rotate,
         fps: value(args, "--fps").map(str::to_string),
-        text: value(args, "--text").unwrap_or("OMARCHY").to_string(),
+        text,
+        literal_text,
         audio: args.iter().any(|a| a == "--audio"),
         namespace: env_or("OMARCHY_BG_LIVE_NAMESPACE", value(args, "--namespace"))
             .unwrap_or_else(|| "omarchy-ttfx-layer".into()),
@@ -259,12 +280,13 @@ pub fn run(args: &[String]) -> Result<()> {
         next = (next + 1) % order.len();
         let producer_stop = Arc::new(AtomicBool::new(false));
         let producer = {
+            let literal_text = opts.literal_text.clone();
             let (cfg, effect, snapshot, generation, stop, wakeup) =
                 (cfg.clone(), effect.clone(), snapshot.clone(), generation.clone(), producer_stop.clone(), wakeup.clone());
             thread::Builder::new().name(format!("ttfx-gpu-{effect}")).spawn(move || {
                 frame_wakeup::set_current(Some(wakeup));
-                let result = run_direct_render(
-                    &cfg, &effect, cols, rows, false, cell_aspect, snapshot, generation, stop,
+                let result = run_direct_render_with_input(
+                    &cfg, &effect, cols, rows, false, cell_aspect, snapshot, generation, stop, literal_text.as_deref(),
                 );
                 frame_wakeup::set_current(None);
                 result
@@ -304,6 +326,107 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         std::iter::once("omarchy-ttfx-layer").chain(list.iter().copied()).map(String::from).collect()
+    }
+
+    struct InputFile(std::path::PathBuf);
+    impl InputFile {
+        fn new(bytes: &[u8]) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!("ttfx-standalone-text-{}-{}-{}", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &str { self.0.to_str().unwrap() }
+    }
+    impl Drop for InputFile {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+
+    #[test]
+    fn text_file_preserves_utf8_spaces_lines_and_empty_input() {
+        for text in ["  /\\  \n /__\\ \n\n", " \té♥  \r\n\n ", "", "OMARCHY", "  OMARCHY\n"] {
+            let file = InputFile::new(text.as_bytes());
+            let o = parse(&args(&["--text-file", file.path()])).unwrap();
+            assert_eq!(o.literal_text.as_deref(), Some(text));
+            let input = crate::wordmark::direct_input(o.literal_text.as_deref(), &o.text, 120, 40, "block", 2.);
+            assert_eq!(input.as_bytes(), text.as_bytes());
+            assert!(matches!(input, std::borrow::Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn explicit_text_wins_in_both_orders_without_reading_ignored_file() {
+        for flags in [vec!["--text", "Custom\n  text", "--text-file", "/no/such/ttfx-input"],
+                      vec!["--text-file", "/no/such/ttfx-input", "--text", "Custom\n  text"]] {
+            let o = parse(&args(&flags)).unwrap();
+            assert_eq!(o.text, "Custom\n  text");
+            assert_eq!(o.literal_text, None);
+            assert_eq!(crate::wordmark::direct_input(None, &o.text, 80, 30, "native", 2.),
+                crate::wordmark::canvas_input(&o.text, 80, 30, "native", 2.));
+        }
+        let o = parse(&args(&["--text", "", "--text-file", "/no/such/ttfx-input"])).unwrap();
+        assert_eq!(o.text, "");
+        assert!(o.literal_text.is_none());
+        let o = parse(&args(&[])).unwrap();
+        assert_eq!(o.text, "OMARCHY");
+        assert!(o.literal_text.is_none());
+        assert_eq!(crate::wordmark::direct_input(None, &o.text, 120, 40, "native", 2.),
+            crate::wordmark::canvas_input("OMARCHY", 120, 40, "native", 2.));
+    }
+
+    #[test]
+    fn text_file_errors_identify_flag_and_path_before_renderer_startup() {
+        for flags in [vec!["--text-file"], vec!["--text-file", "--audio"], vec!["--text-file", ""]] {
+            assert!(parse(&args(&flags)).unwrap_err().to_string().contains("--text-file requires"));
+        }
+        let bad_utf8 = InputFile::new(&[0xff, 0xfe]);
+        for path in [bad_utf8.path(), "/no/such/ttfx-input"] {
+            let error = format!("{:#}", parse(&args(&["--text-file", path])).unwrap_err());
+            assert!(error.contains("--text-file") && error.contains(path), "{error}");
+        }
+        let error = parse(&args(&["--text-file", std::env::temp_dir().to_str().unwrap()])).unwrap_err();
+        assert!(error.to_string().contains("cannot read UTF-8 file"));
+    }
+
+    #[test]
+    #[ignore = "explicit real ASM input gate; no Wayland surface, errors if ASM unavailable"]
+    fn text_file_literal_input_reaches_real_asm() {
+        use clap::Parser;
+        use crate::asm_direct_bridge::emit_frame;
+        use ttfx::asm::{self, DirectFrameHook};
+        use ttfx::engine::{effect::RunOutcome, terminal::TerminalConfig};
+        use ttfx::utils::rng::Rng;
+        assert!(asm::tier() > 0, "real ASM input gate unavailable");
+        let raw = "   @X  \n /_\\   \n\n";
+        let file = InputFile::new(raw.as_bytes());
+        let opts = parse(&args(&["--text-file", file.path()])).unwrap();
+        let input = crate::wordmark::direct_input(opts.literal_text.as_deref(), &opts.text, 80, 24, "native", 2.);
+        assert_eq!(input.as_bytes(), raw.as_bytes());
+        let effect = ttfx::cli::Cli::try_parse_from(["ttfx", "print"]).unwrap().effect.unwrap();
+        let config = TerminalConfig { canvas_width: 80, canvas_height: 24, frame_rate: 60,
+            ignore_terminal_dimensions: true, ..TerminalConfig::default() };
+        let mut rng = Rng::seeded(12345);
+        let slot = Arc::new(Mutex::new(vec![]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut sink = crate::FrameSink::new(slot.clone(), generation.clone(), Arc::new(AtomicBool::new(false)), (80, 24));
+        let hook = DirectFrameHook { emit: emit_frame, ctx: (&mut sink as *mut crate::FrameSink).cast() };
+        // SAFETY: sink is exclusive and live for this synchronous ASM call;
+        // the production callback decodes borrowed grid/pool before returning.
+        let result = unsafe { asm::run_direct(asm::Run { effect: &effect, input: &input, config: &config,
+            rng: &mut rng, parity_dump: false, virtual_clock: true, max_frames: Some(2000),
+            tty_output: false, audio: None }, hook) }.unwrap();
+        assert_eq!(result, RunOutcome::Complete);
+        assert!(generation.load(Ordering::Acquire) > 0);
+        assert!(sink.error.is_none());
+        let frame = slot.lock().unwrap();
+        let find = |ch| frame.iter().find(|cell| cell.ch == ch).unwrap_or_else(|| panic!("missing {ch:?} in {frame:?}"));
+        let (at, x, slash, under, back) = (find('@'), find('X'), find('/'), find('_'), find('\\'));
+        assert_eq!((x.x, x.y), (at.x + 1, at.y));
+        assert_eq!((under.x, under.y), (slash.x + 1, slash.y));
+        assert_eq!((back.x, back.y), (slash.x + 2, slash.y));
+        assert_eq!((at.x, slash.y), (slash.x + 2, at.y + 1));
     }
 
     #[test]

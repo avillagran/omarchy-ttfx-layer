@@ -3762,6 +3762,7 @@ fn run_ttfx_asm_direct(
     cell_aspect: f32,
     state: &AudioState,
     sink: FrameSink,
+    literal_input: Option<&str>,
 ) -> Result<()> {
     use clap::Parser;
     use ttfx::asm::{self, AudioHook, DirectFrameHook};
@@ -3779,7 +3780,7 @@ fn run_ttfx_asm_direct(
         } => effect,
         _ => anyhow::bail!("unknown assembly catalog effect: {effect_name}"),
     };
-    let input = wordmark::canvas_input(&cfg.ttfx_text, cols, rows, &cfg.char_style, cell_aspect);
+    let input = wordmark::direct_input(literal_input, &cfg.ttfx_text, cols, rows, &cfg.char_style, cell_aspect);
     let config = TerminalConfig {
         canvas_width: cols as i64,
         canvas_height: rows as i64,
@@ -3867,6 +3868,21 @@ fn run_direct_render(
     generation: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    run_direct_render_with_input(cfg, effect, cols, rows, with_intro, cell_aspect, snapshot, generation, stop, None)
+}
+
+fn run_direct_render_with_input(
+    cfg: &Config,
+    effect: &str,
+    cols: usize,
+    rows: usize,
+    with_intro: bool,
+    cell_aspect: f32,
+    snapshot: Arc<std::sync::Mutex<Vec<DirectCell>>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    literal_input: Option<&str>,
+) -> Result<()> {
     let state = AudioState::start(cfg.audio);
     let mut scr = Screen::new_direct(cols, rows, snapshot, generation, stop.clone());
     let palette = if cfg.use_theme_colors {
@@ -3915,7 +3931,7 @@ fn run_direct_render(
             stop,
             (cols, rows),
         );
-        return run_ttfx_asm_direct(cfg, effect, cols, rows, cell_aspect, &state, sink);
+        return run_ttfx_asm_direct(cfg, effect, cols, rows, cell_aspect, &state, sink, literal_input);
     }
     while !stop.load(Ordering::Relaxed) {
         let result = match effect {
