@@ -1,0 +1,45 @@
+# Maintainer: Andrés Villagrán <andres@villagranquiroz.cl>
+
+pkgname=omarchy-ttfx-layer
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='The ttfx text effects drawn by the GPU on a Wayland layer, one per output, as a background or a screensaver'
+arch=('x86_64' 'aarch64')
+url='https://github.com/avillagran/omarchy-ttfx-layer'
+license=('MIT')
+depends=('gtk4' 'gtk4-layer-shell' 'pango' 'cairo' 'glib2' 'libglvnd' 'wayland')
+makedepends=('git' 'rust')
+makedepends_x86_64=('nasm')
+optdepends=(
+  'hyprland: output size and scale without --width/--height/--scale'
+  'omarchy-ambient: runs it as the Omarchy Effects background and screensaver'
+)
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+_crate=$pkgname/bin/ttfx-bg-rs
+
+prepare() {
+  cd "$_crate"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_crate"
+  # Without the vte feature the binary does not link libvte: only the GPU layer.
+  cargo build --release --frozen --no-default-features
+}
+
+check() {
+  cd "$_crate"
+  # The suite shares FreeType state between tests, so it runs one at a time.
+  cargo test --release --frozen --no-default-features -- --test-threads=1
+}
+
+package() {
+  cd "$_crate"
+  # The program selects its standalone mode from this name.
+  install -Dm755 target/release/ttfx-bg-rs "$pkgdir/usr/bin/omarchy-ttfx-layer"
+  install -Dm644 "$srcdir/$pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/$pkgname/ttfx-src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ttfx"
+}
