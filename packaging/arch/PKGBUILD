@@ -1,7 +1,7 @@
 # Maintainer: Andrés Villagrán <andres@villagranquiroz.cl>
 
 pkgname=omarchy-ttfx-layer
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc='The ttfx text effects drawn by the GPU on a Wayland layer, one per output, as a background or a screensaver'
 arch=('x86_64' 'aarch64')

@@ -2,8 +2,10 @@
 
 Select a scene with `--neon-scene NAME`. All of them are procedural geometry on
 the existing standalone glyph renderer. Audio is always on and comes from the
-playback monitor, keyboard is `none`, and the layer is bottom. Named scenes exclude
-interactive Matrix, Eye and Tunnel; unknown or missing names fail before startup.
+playback monitor. The same scene runs as a background on the bottom layer or as a
+screensaver on the overlay layer, whichever layer and keyboard mode the caller asks
+for. Named scenes exclude interactive Matrix, Eye and Tunnel; unknown or missing
+names fail before startup.
 The live selector uses the same models. Silence keeps full motion, and music adds
 to it without changing travel speed. A frame identical to the last one is not
 published.

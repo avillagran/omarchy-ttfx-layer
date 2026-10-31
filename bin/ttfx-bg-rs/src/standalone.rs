@@ -132,7 +132,6 @@ pub fn parse(args: &[String]) -> Result<Options> {
     let interactive_tunnel=args.iter().any(|a|a=="--interactive-tunnel")||neon_scene.is_some();
     if [interactive_matrix,interactive_eye,interactive_tunnel].into_iter().filter(|v|*v).count()>1 { bail!("choose one interactive background"); }
     if interactive_matrix || interactive_eye || interactive_tunnel {
-        if overlay || keyboard_exclusive { bail!("interactive backgrounds require bottom layer and keyboard none"); }
         if value(args,"--effects").is_some() && effects != ["matrix"] { bail!("interactive Matrix only supports --effects matrix"); }
         effects=vec!["matrix".into()];
     }
@@ -558,33 +557,33 @@ mod tests {
         for name in ["neon-city","vector-highway","circuit-run","sunset-drive"] {
             let o=parse(&args(&["--neon-scene",name])).unwrap();assert!(o.neon_scene.is_some()&&o.audio&&o.interactive_tunnel);
             for conflict in ["--interactive-eye","--interactive-matrix","--interactive-tunnel"] {assert!(parse(&args(&["--neon-scene",name,conflict])).is_err());}
-            assert!(parse(&args(&["--neon-scene",name,"--layer","overlay"])).is_err());
+            assert!(parse(&args(&["--neon-scene",name,"--layer","overlay","--keyboard","exclusive"])).is_ok());
         }
         assert!(parse(&args(&["--neon-scene","unknown"])).is_err());
         assert!(parse(&args(&["--neon-scene"])).is_err());
     }
     #[test]
-    fn tunnel_is_audio_reactive_exclusive_and_background_only() {
+    fn tunnel_is_audio_reactive_and_exclusive() {
         let o=parse(&args(&["--interactive-tunnel"])).unwrap();assert!(o.interactive_tunnel&&o.audio);
         for conflict in ["--interactive-eye","--interactive-matrix"] {assert!(parse(&args(&["--interactive-tunnel",conflict])).is_err());}
-        assert!(parse(&args(&["--interactive-tunnel","--layer","overlay"])).is_err());
+        assert!(parse(&args(&["--interactive-tunnel","--layer","overlay"])).is_ok());
     }
     #[test]
     fn interactive_eye_is_background_only_and_always_sound_reactive() {
         let o=parse(&args(&["--interactive-eye"])).unwrap();assert!(o.interactive_eye && o.audio);
         assert!(parse(&args(&["--interactive-eye","--interactive-matrix"])).is_err());
-        assert!(parse(&args(&["--interactive-eye","--layer","overlay"])).is_err());
+        assert!(parse(&args(&["--interactive-eye","--layer","overlay"])).is_ok());
         assert_eq!(startup_response(&args(&["--probe","--interactive-eye-probe"])),Some("omarchy-ttfx-layer interactive-eye 1"));
         assert!(parse(&args(&["--interactive-matrix"])).unwrap().audio);
     }
     #[test]
-    fn interactive_matrix_is_an_explicit_background_only_mode() {
+    fn interactive_matrix_is_an_explicit_mode() {
         let opts=parse(&args(&["--interactive-matrix"])).unwrap();
         assert!(opts.interactive_matrix);
         assert_eq!(opts.effects, ["matrix"]);
         assert!(!parse(&args(&[])).unwrap().interactive_matrix);
-        assert!(parse(&args(&["--interactive-matrix","--layer","overlay"])).is_err());
-        assert!(parse(&args(&["--interactive-matrix","--keyboard","exclusive"])).is_err());
+        assert!(parse(&args(&["--interactive-matrix","--layer","overlay"])).is_ok());
+        assert!(parse(&args(&["--interactive-matrix","--keyboard","exclusive"])).is_ok());
         assert!(parse(&args(&["--interactive-matrix","--effects","rings"])).is_err());
         assert_eq!(startup_response(&args(&["--probe","--interactive-matrix-probe"])),Some("omarchy-ttfx-layer interactive-matrix 1"));
         assert_eq!(startup_response(&args(&["--probe","--capabilities"])),Some(CAPABILITIES));

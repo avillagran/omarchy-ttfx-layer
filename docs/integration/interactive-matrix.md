@@ -1,7 +1,6 @@
 # Interactive Matrix
 
-Opt in with `omarchy-ttfx-layer --interactive-matrix` on a bottom layer with
-keyboard `none`. This is a new rain simulation using the existing clipped GPU
+Opt in with `omarchy-ttfx-layer --interactive-matrix`. This is a new rain simulation using the existing clipped GPU
 glyph renderer/cache, not an equivalence-preserving change to the TTFX Matrix.
 It reads no branding and does not change ordinary effect behavior.
 
@@ -41,8 +40,7 @@ uses elapsed seconds and the existing adaptive FPS governor, with a 60 FPS cap.
 
 Feature handshake: `--standalone --probe --interactive-matrix-probe` returns
 `omarchy-ttfx-layer interactive-matrix 1`. Existing capability reply is unchanged.
-Rejects overlay/exclusive keyboard and other explicit effects. An Ambient source
-can run it with background placement only.
+Rejects other explicit effects.
 
 Bass birth rate is proportional to the smoothed low-band envelope, with a
 bounded pool. Treble alone does not add streams; bass alone does not lighten

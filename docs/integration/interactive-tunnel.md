@@ -16,5 +16,5 @@ chassis and 14 world-unit trails, clipped at the near plane. The glyphs `▬` an
 The global cursor eases camera offset and roll, also over windows. Audio is always
 on: treble launches brighter sections, bass adds packets of light and pulses the
 ceiling strips, and travel speed stays constant. Silence keeps the base motion.
-Desktop and live preview share this model. The mode needs a bottom layer with
-keyboard `none` and excludes interactive Matrix and Eye.
+Desktop, screensaver and live preview share this model. The mode excludes
+interactive Matrix and Eye.
