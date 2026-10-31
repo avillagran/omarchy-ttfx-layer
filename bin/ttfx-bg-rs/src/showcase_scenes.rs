@@ -750,11 +750,20 @@ struct Car {
     dir: f32,
     speed: f32,
 }
+type CityKey = (i32, i32, usize, usize, u32, u32, u32);
 struct CityRain {
     cars: Vec<Car>,
     time: f32,
     flash: f32,
+    layer: std::cell::RefCell<(CityKey, Vec<(i32, i32, f32, char, Color)>)>,
     rng: Rng,
+}
+/// Collects a static layer so it can be replayed instead of recomputed.
+struct Bake(Vec<(i32, i32, f32, char, Color)>);
+impl Bake {
+    fn dot(&mut self, x: i32, y: i32, z: f32, ch: char, color: Color) {
+        self.0.push((x, y, z, ch, color));
+    }
 }
 // Variable block sizes repeat over a period so the city never looks tiled.
 const COL_W: [f32; 6] = [44., 30., 58., 36., 50., 32.];
@@ -787,6 +796,7 @@ impl CityRain {
             cars,
             time: 0.,
             flash: 0.,
+            layer: Default::default(),
             rng,
         }
     }
@@ -805,115 +815,143 @@ impl CityRain {
         let pan_y = gaze.1 * rows as f32 * 0.05 + self.time * 0.3;
         let base = 0.75 + self.flash * 0.8;
         // Streets first, then every block as a solid, outlined building or park.
-        for y in 0..rows {
-            for x in 0..cols {
-                let wx = x as f32 + pan_x;
-                let wy = y as f32 + pan_y;
-                let (ci, fx, bw) = span_at(wx, &COL_W);
-                let (ri, fy, bh) = span_at(wy, &ROW_H);
-                let on_street = fx >= bw || fy >= bh;
-                if on_street {
-                    let ch = if fx >= bw && fy >= bh {
-                        ' '
-                    } else if fx >= bw {
-                        if (fx - bw) as i32 == 2 && (wy as i32) % 2 == 0 {
-                            '¦'
-                        } else {
-                            ' '
+        // The city barely changes between frames: rebuild it only when the view
+        // moves a whole cell or the light steps, and replay it otherwise.
+        let (view_x, view_y) = (pan_x.floor(), pan_y.floor());
+        let key = (
+            view_x as i32,
+            view_y as i32,
+            cols,
+            rows,
+            (self.flash * 6.) as u32,
+            (sound.treble * 5.) as u32,
+            (self.time * 3.) as u32,
+        );
+        let mut layer = self.layer.borrow_mut();
+        if layer.0 != key {
+            layer.0 = key;
+            let mut bake = Bake(std::mem::take(&mut layer.1));
+            bake.0.clear();
+            {
+                let r = &mut bake;
+                let (pan_x, pan_y) = (view_x, view_y);
+                for y in 0..rows {
+                    for x in 0..cols {
+                        let wx = x as f32 + pan_x;
+                        let wy = y as f32 + pan_y;
+                        let (ci, fx, bw) = span_at(wx, &COL_W);
+                        let (ri, fy, bh) = span_at(wy, &ROW_H);
+                        let on_street = fx >= bw || fy >= bh;
+                        if on_street {
+                            let ch = if fx >= bw && fy >= bh {
+                                ' '
+                            } else if fx >= bw {
+                                if (fx - bw) as i32 == 2 && (wy as i32) % 2 == 0 {
+                                    '¦'
+                                } else {
+                                    ' '
+                                }
+                            } else if (fy - bh) as i32 == 2 && (wx as i32) % 4 < 2 {
+                                '-'
+                            } else {
+                                ' '
+                            };
+                            if ch != ' ' {
+                                r.dot(
+                                    x as i32,
+                                    y as i32,
+                                    8.,
+                                    ch,
+                                    scale((120, 125, 140), base * 0.8),
+                                );
+                            }
+                            continue;
                         }
-                    } else if (fy - bh) as i32 == 2 && (wx as i32) % 4 < 2 {
-                        '-'
-                    } else {
-                        ' '
-                    };
-                    if ch != ' ' {
-                        r.dot(
-                            x as i32,
-                            y as i32,
-                            8.,
-                            ch,
-                            scale((120, 125, 140), base * 0.8),
+                        let seed = variant(
+                            (ci as u32).wrapping_mul(2654435761) ^ (ri as u32).wrapping_mul(40503),
                         );
-                    }
-                    continue;
-                }
-                let seed =
-                    variant((ci as u32).wrapping_mul(2654435761) ^ (ri as u32).wrapping_mul(40503));
-                if seed < 0.16 {
-                    // Park: tree clumps, a pond and winding paths.
-                    let t = noise(wx * 0.3, wy * 0.6);
-                    let pond = ((fx - bw * 0.5) / (bw * 0.25)).powi(2)
-                        + ((fy - bh * 0.5) / (bh * 0.3)).powi(2)
-                        < 1.;
-                    let (ch, c) = if pond {
-                        (
-                            '~',
-                            scale(
-                                (60, 120, 200),
-                                base * (0.6 + 0.3 * (self.time * 2. + wx).sin().abs()),
-                            ),
-                        )
-                    } else if t > 0.7 {
-                        ('♣', scale((60, 170, 80), base))
-                    } else if t > 0.58 {
-                        ('"', scale((50, 130, 70), base))
-                    } else if ((wx * 0.3 + wy * 0.5).sin() * 4.).fract().abs() < 0.08 {
-                        ('·', scale((140, 130, 100), base * 0.7))
-                    } else {
-                        (' ', (0, 0, 0))
-                    };
-                    if ch != ' ' {
+                        if seed < 0.16 {
+                            // Park: tree clumps, a pond and winding paths.
+                            let t = noise(wx * 0.3, wy * 0.6);
+                            let pond = ((fx - bw * 0.5) / (bw * 0.25)).powi(2)
+                                + ((fy - bh * 0.5) / (bh * 0.3)).powi(2)
+                                < 1.;
+                            let (ch, c) = if pond {
+                                (
+                                    '~',
+                                    scale(
+                                        (60, 120, 200),
+                                        base * (0.6 + 0.3 * (self.time * 2. + wx).sin().abs()),
+                                    ),
+                                )
+                            } else if t > 0.7 {
+                                ('♣', scale((60, 170, 80), base))
+                            } else if t > 0.58 {
+                                ('"', scale((50, 130, 70), base))
+                            } else if ((wx * 0.3 + wy * 0.5).sin() * 4.).fract().abs() < 0.08 {
+                                ('·', scale((140, 130, 100), base * 0.7))
+                            } else {
+                                (' ', (0, 0, 0))
+                            };
+                            if ch != ' ' {
+                                r.dot(x as i32, y as i32, 9., ch, c);
+                            }
+                            continue;
+                        }
+                        // Building: inset roof with a lit parapet on the top/left edges
+                        // (the light comes from the upper left), roof texture, vents.
+                        let inset = 1.;
+                        let (rx, ry) = (fx - inset, fy - inset);
+                        let (rw, rh) = (bw - 2. * inset, bh - 2. * inset);
+                        if rx < 0. || ry < 0. || rx >= rw || ry >= rh {
+                            continue;
+                        }
+                        let height = 0.3 + seed * 0.7;
+                        let roof = mix((45, 55, 80), (90, 120, 140), height);
+                        let edge_x = rx < 1. || rx >= rw - 1.;
+                        let edge_y = ry < 1. || ry >= rh - 1.;
+                        let lit = rx < 1. || ry < 1.;
+                        let (ch, c) = if edge_x || edge_y {
+                            (
+                                if edge_x && edge_y {
+                                    '+'
+                                } else if edge_y {
+                                    '═'
+                                } else {
+                                    '║'
+                                },
+                                scale(roof, base * if lit { 1.8 } else { 1.1 }),
+                            )
+                        } else {
+                            let s2 = variant(
+                                (ci as u32)
+                                    .wrapping_mul(7)
+                                    .wrapping_add((ri as u32).wrapping_mul(13))
+                                    .wrapping_mul(99991),
+                            );
+                            let unit = ((rx / rw - 0.5) * 2.).abs() < 0.35 + s2 * 0.3
+                                && ((ry / rh - 0.5) * 2.).abs() < 0.3 + s2 * 0.3;
+                            if unit && (rx as i32 + ry as i32 * 2) % 5 == 0 {
+                                (
+                                    '▪',
+                                    scale((255, 215, 130), base * (0.35 + sound.treble * 0.5)),
+                                )
+                            } else if (rx + ry * 3. + s2 * 7.) as i32 % 9 == 0 {
+                                ('·', scale(roof, base * 0.9))
+                            } else {
+                                ('░', scale(roof, base * 0.55))
+                            }
+                        };
                         r.dot(x as i32, y as i32, 9., ch, c);
                     }
-                    continue;
                 }
-                // Building: inset roof with a lit parapet on the top/left edges
-                // (the light comes from the upper left), roof texture, vents.
-                let inset = 1.;
-                let (rx, ry) = (fx - inset, fy - inset);
-                let (rw, rh) = (bw - 2. * inset, bh - 2. * inset);
-                if rx < 0. || ry < 0. || rx >= rw || ry >= rh {
-                    continue;
-                }
-                let height = 0.3 + seed * 0.7;
-                let roof = mix((45, 55, 80), (90, 120, 140), height);
-                let edge_x = rx < 1. || rx >= rw - 1.;
-                let edge_y = ry < 1. || ry >= rh - 1.;
-                let lit = rx < 1. || ry < 1.;
-                let (ch, c) = if edge_x || edge_y {
-                    (
-                        if edge_x && edge_y {
-                            '+'
-                        } else if edge_y {
-                            '═'
-                        } else {
-                            '║'
-                        },
-                        scale(roof, base * if lit { 1.8 } else { 1.1 }),
-                    )
-                } else {
-                    let s2 = variant(
-                        (ci as u32)
-                            .wrapping_mul(7)
-                            .wrapping_add((ri as u32).wrapping_mul(13))
-                            .wrapping_mul(99991),
-                    );
-                    let unit = ((rx / rw - 0.5) * 2.).abs() < 0.35 + s2 * 0.3
-                        && ((ry / rh - 0.5) * 2.).abs() < 0.3 + s2 * 0.3;
-                    if unit && (rx as i32 + ry as i32 * 2) % 5 == 0 {
-                        (
-                            '▪',
-                            scale((255, 215, 130), base * (0.35 + sound.treble * 0.5)),
-                        )
-                    } else if (rx + ry * 3. + s2 * 7.) as i32 % 9 == 0 {
-                        ('·', scale(roof, base * 0.9))
-                    } else {
-                        ('░', scale(roof, base * 0.55))
-                    }
-                };
-                r.dot(x as i32, y as i32, 9., ch, c);
             }
+            layer.1 = bake.0;
         }
+        for &(x, y, z, ch, color) in &layer.1 {
+            r.dot(x, y, z, ch, color);
+        }
+        drop(layer);
         // Traffic lights where the streets cross, red/green per crossing.
         let (px, py) = (pan_x, pan_y);
         let mut sx = -(px.rem_euclid(1.));
@@ -1310,8 +1348,11 @@ impl Cockpit {
         let px = cx + cols as f32 * 0.22 - gaze.0 * cols as f32 * 0.08;
         let py = cy - rows as f32 * 0.16 - gaze.1 * rows as f32 * 0.06;
         let pr = rows as f32 * 0.11;
-        for y in 0..rows {
-            for x in 0..cols {
+        let span = |c: f32, r: f32, max: usize| {
+            ((c - r).max(0.) as usize)..((c + r + 2.).clamp(0., max as f32) as usize)
+        };
+        for y in span(py, pr, rows) {
+            for x in span(px, pr * aspect, cols) {
                 let nx = (x as f32 - px) / (pr * aspect);
                 let ny = (y as f32 - py) / pr;
                 let d = nx * nx + ny * ny;

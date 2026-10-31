@@ -12,7 +12,7 @@
 //! omarchy-ttfx-layer --output <name> --layer bottom|overlay --keyboard none|exclusive
 //!                    [--effects a,b,c] [--rotate <seconds>] [--fps auto|<n>]
 //!                    [--text <wordmark> | --text-file <UTF-8 path>] [--audio] [--namespace <ns>]
-//!                    [--width <px> --height <px> --scale <n>] [--resolution <1-8>]
+//!                    [--width <px> --height <px> --scale <n>] [--resolution <1-8|auto>]
 //! ```
 //!
 //! The output size comes from `--width/--height/--scale` (physical pixels),
@@ -168,7 +168,10 @@ pub fn parse(args: &[String]) -> Result<Options> {
         namespace: env_or("OMARCHY_BG_LIVE_NAMESPACE", value(args, "--namespace"))
             .unwrap_or_else(|| "omarchy-ttfx-layer".into()),
         size,
-        resolution: value(args, "--resolution").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 8),
+        resolution: match value(args, "--resolution") {
+            Some("auto") => AUTO_RESOLUTION,
+            other => other.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 8),
+        },
     })
 }
 
@@ -189,6 +192,23 @@ fn hyprland_output_size(output: Option<&str>) -> Result<(i32, i32, f64)> {
 }
 
 /// Grid for an output: the same cell size the plugin's GPU path picks.
+const AUTO_RESOLUTION: i64 = 0;
+
+/// The finest grid a screen deserves. Density follows the display scale, so a
+/// Retina panel is not asked for more cells than its GPU and CPU can move, and
+/// a very wide output is capped: the renderer's cost follows the grid's size.
+fn auto_resolution(width: i32, scale: f64) -> i64 {
+    const MAX_COLS: f64 = 360.0;
+    const GLYPH_WIDTH: f64 = 0.6;
+    let integer_scale = scale.ceil().max(1.0);
+    let logical = width as f64 / scale;
+    let start = integer_scale as i64;
+    (start..=8)
+        .find(|&r| logical / (9.0 / integer_scale * r as f64 * GLYPH_WIDTH) <= MAX_COLS)
+        .unwrap_or(8)
+        .clamp(1, 8)
+}
+
 fn grid_for(width: i32, height: i32, scale: f64, resolution: i64) -> (usize, usize, f64, f32) {
     let logical = ((width as f64 / scale).round() as i32, (height as f64 / scale).round() as i32);
     let integer_scale = scale.ceil().max(1.0);
@@ -253,12 +273,17 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(size) => size,
         None => hyprland_output_size(opts.output.as_deref())?,
     };
-    let (cols, rows, cell_px, cell_aspect) = grid_for(width, height, scale, opts.resolution);
+    let resolution = if opts.resolution == AUTO_RESOLUTION {
+        auto_resolution(width, scale)
+    } else {
+        opts.resolution
+    };
+    let (cols, rows, cell_px, cell_aspect) = grid_for(width, height, scale, resolution);
     let cfg = Config {
         effects: opts.effects.clone(),
         audio: opts.audio,
         ttfx_text: opts.text.clone(),
-        resolution: opts.resolution,
+        resolution,
         show_fps: false,
         transparent_background: false,
         boot_between: false,
@@ -393,6 +418,17 @@ mod tests {
         std::iter::once("omarchy-ttfx-layer").chain(list.iter().copied()).map(String::from).collect()
     }
 
+    #[test]
+    fn auto_resolution_follows_the_scale_and_caps_wide_outputs() {
+        assert_eq!(auto_resolution(3456, 2.0), 2);
+        assert_eq!(auto_resolution(2560, 2.0), 2);
+        assert_eq!(auto_resolution(1920, 1.0), 1);
+        assert_eq!(auto_resolution(2560, 1.0), 2);
+        assert_eq!(auto_resolution(3840, 1.0), 2);
+        assert_eq!(auto_resolution(3840, 2.0), 2);
+        assert_eq!(auto_resolution(2880, 1.5), 2);
+        assert!(parse(&args(&["--neon-scene", "neon-city", "--resolution", "auto"])).is_ok());
+    }
     #[test]
     fn capabilities_precede_probe_and_all_startup_work() {
         assert_eq!(CAPABILITIES, "omarchy-ttfx-layer capabilities: text-file-v1 standalone-config-v1");
