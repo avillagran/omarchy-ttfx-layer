@@ -52,6 +52,10 @@ Three variants add a backdrop, and their digits tremble on the bass:
 - `sand-clock-dunes`: ridge layers, with wind and lifted sand on bass.
 - `sand-clock-galaxy`: a three-arm spiral with a bass ring and treble stars.
 
+`--resolution auto` picks the grid from the display: cell density follows its
+scale, capped at about 360 columns, because the renderer's cost follows the size
+of the grid rather than the cells a scene draws.
+
 The manual test `showcase_frame_cost` reports step and draw time per scene:
 
     cargo test --release --no-default-features --bin ttfx-bg-rs -- \
