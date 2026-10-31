@@ -62,6 +62,10 @@ pub struct Options {
     // Literal file contents, read once before starting any renderer threads.
     pub literal_text: Option<String>,
     pub audio: bool,
+    pub interactive_matrix: bool,
+    pub interactive_eye: bool,
+    pub interactive_tunnel: bool,
+    pub neon_scene: Option<crate::neon_scenes::Style>,
     pub namespace: String,
     pub size: Option<(i32, i32, f64)>,
     pub resolution: i64,
@@ -110,7 +114,7 @@ pub fn parse(args: &[String]) -> Result<Options> {
         "exclusive" => true,
         other => bail!("--keyboard must be none or exclusive, not {other}"),
     };
-    let effects: Vec<String> = match value(args, "--effects") {
+    let mut effects: Vec<String> = match value(args, "--effects") {
         Some(list) => list.split(',').map(str::trim).filter(|e| !e.is_empty()).map(str::to_string).collect(),
         None => DEFAULT_EFFECTS.iter().map(|e| e.to_string()).collect(),
     };
@@ -119,6 +123,18 @@ pub fn parse(args: &[String]) -> Result<Options> {
     }
     if effects.is_empty() {
         bail!("--effects is empty");
+    }
+    let interactive_matrix = args.iter().any(|a|a=="--interactive-matrix");
+    let interactive_eye = args.iter().any(|a|a=="--interactive-eye");
+    let neon_scene=match value(args,"--neon-scene") {Some(name)=>Some(crate::neon_scenes::Style::parse(name).ok_or_else(||anyhow::anyhow!("unknown neon scene: {name}"))?),None=>None};
+    if args.iter().any(|a|a=="--neon-scene") && neon_scene.is_none(){bail!("--neon-scene needs a name");}
+    if neon_scene.is_some() && args.iter().any(|a|a=="--interactive-tunnel"){bail!("choose tunnel or named scene");}
+    let interactive_tunnel=args.iter().any(|a|a=="--interactive-tunnel")||neon_scene.is_some();
+    if [interactive_matrix,interactive_eye,interactive_tunnel].into_iter().filter(|v|*v).count()>1 { bail!("choose one interactive background"); }
+    if interactive_matrix || interactive_eye || interactive_tunnel {
+        if overlay || keyboard_exclusive { bail!("interactive backgrounds require bottom layer and keyboard none"); }
+        if value(args,"--effects").is_some() && effects != ["matrix"] { bail!("interactive Matrix only supports --effects matrix"); }
+        effects=vec!["matrix".into()];
     }
     let rotate = match value(args, "--rotate") {
         Some(v) => Duration::from_secs(v.parse::<u64>().context("--rotate takes seconds")?.max(5)),
@@ -144,7 +160,11 @@ pub fn parse(args: &[String]) -> Result<Options> {
         fps: value(args, "--fps").map(str::to_string),
         text,
         literal_text,
-        audio: args.iter().any(|a| a == "--audio"),
+        audio: interactive_matrix || interactive_eye || interactive_tunnel || args.iter().any(|a| a == "--audio"),
+        interactive_matrix,
+        interactive_eye,
+        interactive_tunnel,
+        neon_scene,
         namespace: env_or("OMARCHY_BG_LIVE_NAMESPACE", value(args, "--namespace"))
             .unwrap_or_else(|| "omarchy-ttfx-layer".into()),
         size,
@@ -201,7 +221,11 @@ pub const CAPABILITIES: &str = "omarchy-ttfx-layer capabilities: text-file-v1 st
 fn startup_response(args: &[String]) -> Option<&'static str> {
     // Must win over --probe: old binaries safely return PROBE for the combined
     // --standalone --probe --capabilities handshake, without starting a layer.
-    if args.iter().any(|arg| arg == "--capabilities") {
+    if args.iter().any(|arg| arg == "--interactive-eye-probe") {
+        Some("omarchy-ttfx-layer interactive-eye 1")
+    } else if args.iter().any(|arg| arg == "--interactive-matrix-probe") {
+        Some("omarchy-ttfx-layer interactive-matrix 1")
+    } else if args.iter().any(|arg| arg == "--capabilities") {
         Some(CAPABILITIES)
     } else if args.iter().any(|arg| arg == "--probe") {
         Some(PROBE)
@@ -245,6 +269,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let generation = Arc::new(AtomicU64::new(0));
     let layer_stop = Arc::new(AtomicBool::new(false));
     let wakeup = Arc::new(frame_wakeup::FrameWakeup::new(layer_stop.clone())?);
+    let pointer = (opts.interactive_matrix || opts.interactive_eye || opts.interactive_tunnel).then(||Arc::new(crate::interactive_matrix::PointerState::default()));
+    let pointer_tracker = pointer.as_ref().map(|p|
+        crate::interactive_matrix::track_global(p.clone(), layer_stop.clone(), opts.output.as_deref(), opts.interactive_eye)
+    ).transpose()?;
     let spec = wl_layer::LayerSpec {
         output: opts.output.clone(),
         namespace: opts.namespace.clone(),
@@ -294,14 +322,27 @@ pub fn run(args: &[String]) -> Result<()> {
         let producer_stop = Arc::new(AtomicBool::new(false));
         let producer = {
             let literal_text = opts.literal_text.clone();
+            let pointer = pointer.clone();
+            let eye = opts.interactive_eye;
+            let tunnel=opts.interactive_tunnel;let scene=opts.neon_scene;
             let (cfg, effect, snapshot, generation, stop, wakeup) =
                 (cfg.clone(), effect.clone(), snapshot.clone(), generation.clone(), producer_stop.clone(), wakeup.clone());
             thread::Builder::new().name(format!("ttfx-gpu-{effect}")).spawn(move || {
-                run_producer(&cfg, &effect, cols, rows, cell_aspect, snapshot, generation, stop, wakeup, literal_text.as_deref())
+                if let Some(pointer) = pointer {
+                    if let Some(scene)=scene {crate::neon_scenes::run(scene,cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup)}
+                    else if tunnel {crate::interactive_tunnel::run(cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup)}
+                    else if eye { crate::interactive_eye::run(cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup) }
+                    else { crate::interactive_matrix::run(cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup) }
+                } else {
+                    run_producer(&cfg, &effect, cols, rows, cell_aspect, snapshot, generation, stop, wakeup, literal_text.as_deref())
+                }
             })?
         };
         log_dbg(&format!("omarchy-ttfx-layer: {effect}"));
-        wait_until(opts.rotate, || finished() || producer.is_finished());
+        while (opts.interactive_matrix || opts.interactive_eye || opts.interactive_tunnel) && !finished() && !producer.is_finished() {
+            wait_until(Duration::from_millis(100), || finished() || producer.is_finished());
+        }
+        if !opts.interactive_matrix && !opts.interactive_eye && !opts.interactive_tunnel { wait_until(opts.rotate, || finished() || producer.is_finished()); }
         producer_stop.store(true, Ordering::Release);
         match producer.join() {
             Ok(Err(error)) => {
@@ -316,6 +357,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     // SIGTERM or the compositor closed the layer: tear the surface down and exit.
     layer_stop.store(true, Ordering::Release);
+    if let Some(tracker) = pointer_tracker { let _ = tracker.join(); }
     let _ = wakeup.drain();
     match layer.join() {
         Ok(Ok(())) => Ok(()),
@@ -475,6 +517,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn named_neon_scenes_require_valid_names_and_background_audio() {
+        for name in ["neon-city","vector-highway","circuit-run","sunset-drive"] {
+            let o=parse(&args(&["--neon-scene",name])).unwrap();assert!(o.neon_scene.is_some()&&o.audio&&o.interactive_tunnel);
+            for conflict in ["--interactive-eye","--interactive-matrix","--interactive-tunnel"] {assert!(parse(&args(&["--neon-scene",name,conflict])).is_err());}
+            assert!(parse(&args(&["--neon-scene",name,"--layer","overlay"])).is_err());
+        }
+        assert!(parse(&args(&["--neon-scene","unknown"])).is_err());
+        assert!(parse(&args(&["--neon-scene"])).is_err());
+    }
+    #[test]
+    fn tunnel_is_audio_reactive_exclusive_and_background_only() {
+        let o=parse(&args(&["--interactive-tunnel"])).unwrap();assert!(o.interactive_tunnel&&o.audio);
+        for conflict in ["--interactive-eye","--interactive-matrix"] {assert!(parse(&args(&["--interactive-tunnel",conflict])).is_err());}
+        assert!(parse(&args(&["--interactive-tunnel","--layer","overlay"])).is_err());
+    }
+    #[test]
+    fn interactive_eye_is_background_only_and_always_sound_reactive() {
+        let o=parse(&args(&["--interactive-eye"])).unwrap();assert!(o.interactive_eye && o.audio);
+        assert!(parse(&args(&["--interactive-eye","--interactive-matrix"])).is_err());
+        assert!(parse(&args(&["--interactive-eye","--layer","overlay"])).is_err());
+        assert_eq!(startup_response(&args(&["--probe","--interactive-eye-probe"])),Some("omarchy-ttfx-layer interactive-eye 1"));
+        assert!(parse(&args(&["--interactive-matrix"])).unwrap().audio);
+    }
+    #[test]
+    fn interactive_matrix_is_an_explicit_background_only_mode() {
+        let opts=parse(&args(&["--interactive-matrix"])).unwrap();
+        assert!(opts.interactive_matrix);
+        assert_eq!(opts.effects, ["matrix"]);
+        assert!(!parse(&args(&[])).unwrap().interactive_matrix);
+        assert!(parse(&args(&["--interactive-matrix","--layer","overlay"])).is_err());
+        assert!(parse(&args(&["--interactive-matrix","--keyboard","exclusive"])).is_err());
+        assert!(parse(&args(&["--interactive-matrix","--effects","rings"])).is_err());
+        assert_eq!(startup_response(&args(&["--probe","--interactive-matrix-probe"])),Some("omarchy-ttfx-layer interactive-matrix 1"));
+        assert_eq!(startup_response(&args(&["--probe","--capabilities"])),Some(CAPABILITIES));
+    }
+
     struct InputFile(std::path::PathBuf);
     impl InputFile {
         fn new(bytes: &[u8]) -> Self {
@@ -543,7 +622,7 @@ mod tests {
         use clap::Parser;
         use crate::asm_direct_bridge::emit_frame;
         use ttfx::asm::{self, DirectFrameHook};
-        use ttfx::engine::{effect::RunOutcome, terminal::TerminalConfig};
+        use ttfx::engine::effect::RunOutcome;
         use ttfx::utils::rng::Rng;
         assert!(asm::tier() > 0, "real ASM input gate unavailable");
         let raw = "   @X  \n /_\\   \n\n";
@@ -552,8 +631,7 @@ mod tests {
         let input = crate::wordmark::direct_input(opts.literal_text.as_deref(), &opts.text, 80, 24, "native", 2.);
         assert_eq!(input.as_bytes(), raw.as_bytes());
         let effect = ttfx::cli::Cli::try_parse_from(["ttfx", "print"]).unwrap().effect.unwrap();
-        let config = TerminalConfig { canvas_width: 80, canvas_height: 24, frame_rate: 60,
-            ignore_terminal_dimensions: true, ..TerminalConfig::default() };
+        let config = crate::direct_catalog_terminal_config(80, 24, 5, true);
         let mut rng = Rng::seeded(12345);
         let slot = Arc::new(Mutex::new(vec![]));
         let generation = Arc::new(AtomicU64::new(0));
@@ -574,6 +652,60 @@ mod tests {
         assert_eq!((under.x, under.y), (slash.x + 1, slash.y));
         assert_eq!((back.x, back.y), (slash.x + 2, slash.y));
         assert_eq!((at.x, slash.y), (slash.x + 2, at.y + 1));
+    }
+
+    #[test]
+    fn direct_catalog_file_anchors_are_centered_without_changing_legacy_text() {
+        use ttfx::engine::canvas::Anchor;
+        for file in [false, true] {
+            let config = crate::direct_catalog_terminal_config(237, 61, 5, file);
+            let anchor = if file { Anchor::C } else { Anchor::Sw };
+            assert_eq!(config.anchor_canvas, anchor);
+            assert_eq!(config.anchor_text, anchor);
+            assert_eq!((config.canvas_width, config.canvas_height, config.frame_rate), (237, 61, 60));
+        }
+    }
+
+    #[test]
+    #[ignore = "real ASM absolute-position gate, no Wayland; requires ASM"]
+    fn text_file_center_is_absolute_on_multiple_output_grids() {
+        use clap::Parser;
+        use ttfx::asm::{self, DirectFrameHook};
+        use ttfx::engine::effect::RunOutcome;
+        use ttfx::utils::rng::Rng;
+        assert!(asm::tier() > 0);
+        let raw = "@   X\n /_\\ \nL   R\n";
+        let file = InputFile::new(raw.as_bytes());
+        let opts = parse(&args(&["--text-file", file.path()])).unwrap();
+        for (cols, rows) in [(80, 24), (237, 61), (312, 93), (173, 46)] {
+            let input = crate::wordmark::direct_input(opts.literal_text.as_deref(), &opts.text, cols, rows, "native", 2.);
+            assert_eq!(input.as_bytes(), raw.as_bytes());
+            let config = crate::direct_catalog_terminal_config(cols, rows, 5, true);
+            let effect = ttfx::cli::Cli::try_parse_from(["ttfx", "print"]).unwrap().effect.unwrap();
+            let mut rng = Rng::seeded(42);
+            let slot = Arc::new(Mutex::new(vec![]));
+            let generation = Arc::new(AtomicU64::new(0));
+            let mut sink = crate::FrameSink::new(slot.clone(), generation, Arc::new(AtomicBool::new(false)), (cols, rows));
+            let hook = DirectFrameHook { emit: crate::asm_direct_bridge::emit_frame, ctx: (&mut sink as *mut crate::FrameSink).cast() };
+            // SAFETY: sink and borrowed input remain live for this synchronous callback.
+            let result = unsafe { asm::run_direct(asm::Run { effect: &effect, input: &input, config: &config,
+                rng: &mut rng, parity_dump: false, virtual_clock: true, max_frames: Some(2000),
+                tty_output: false, audio: None }, hook) }.unwrap();
+            assert_eq!(result, RunOutcome::Complete);
+            assert!(sink.error.is_none());
+            let cells = slot.lock().unwrap();
+            let glyph = |ch| cells.iter().find(|c| c.ch == ch).unwrap();
+            let (left, right, top, bottom) = (glyph('L').x, glyph('R').x, glyph('@').y, glyph('L').y);
+            assert_eq!(right - left, 4);
+            assert_eq!(bottom - top, 2);
+            // Match the engine's one-based C-anchor convention exactly. On
+            // odd grids it rounds the block center one cell up/right.
+            assert_eq!(left as usize, cols.div_ceil(2) - 2);
+            assert_eq!(top as usize, rows - rows.div_ceil(2) - 2);
+            assert!(((left + right) as i64 - (cols as i64 - 1)).abs() <= 2, "{cols}x{rows}: x={left}..{right}");
+            assert!(((top + bottom) as i64 - (rows as i64 - 1)).abs() <= 2, "{cols}x{rows}: y={top}..{bottom}");
+            eprintln!("CENTERED_FILE_GRID {cols}x{rows}: ({left},{top})..({right},{bottom})");
+        }
     }
 
     #[test]

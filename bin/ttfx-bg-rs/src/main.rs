@@ -23,6 +23,11 @@ mod frame_cadence;
 mod frame_handoff;
 mod fps_governor;
 mod standalone;
+mod interactive_matrix;
+mod interactive_eye;
+mod interactive_tunnel;
+mod neon_scenes;
+mod showcase_scenes;
 mod standalone_config;
 mod frame_wakeup;
 mod gpu_grid;
@@ -1045,7 +1050,7 @@ fn main() -> Result<()> {
     // with a JSON-lines protocol. Runs WITHOUT the controller lock — it must
     // coexist with the fullscreen controller.
     if args.iter().any(|a| a == "--preview-daemon") {
-        return run_preview_daemon();
+        return run_preview_daemon(args.iter().any(|a|a=="--ambient-preview"));
     }
 
     arm_parent_death_signal();
@@ -3762,6 +3767,24 @@ fn asm_emit_themed_frame_inner(
     }
 }
 
+// A branding file is a tight artwork block. Center the block with the
+// engine anchors; preserve its internal spacing and the legacy --text canvas.
+fn direct_catalog_terminal_config(cols: usize, rows: usize, speed: i64, file_input: bool) -> ttfx::engine::terminal::TerminalConfig {
+    use ttfx::engine::{canvas::Anchor, terminal::TerminalConfig};
+    let mut config = TerminalConfig {
+        canvas_width: cols as i64,
+        canvas_height: rows as i64,
+        frame_rate: (60.0 * speed_multiplier(speed)).round().clamp(1.0, 60.0) as i64,
+        ignore_terminal_dimensions: true,
+        ..TerminalConfig::default()
+    };
+    if file_input {
+        config.anchor_canvas = Anchor::C;
+        config.anchor_text = Anchor::C;
+    }
+    config
+}
+
 fn run_ttfx_asm_direct(
     cfg: &Config,
     effect_name: &str,
@@ -3775,7 +3798,6 @@ fn run_ttfx_asm_direct(
     use clap::Parser;
     use ttfx::asm::{self, AudioHook, DirectFrameHook};
     use ttfx::engine::effect::RunOutcome;
-    use ttfx::engine::terminal::TerminalConfig;
     use ttfx::utils::rng::Rng;
 
     if asm::tier() == 0 {
@@ -3789,14 +3811,7 @@ fn run_ttfx_asm_direct(
         _ => anyhow::bail!("unknown assembly catalog effect: {effect_name}"),
     };
     let input = wordmark::direct_input(literal_input, &cfg.ttfx_text, cols, rows, &cfg.char_style, cell_aspect);
-    let config = TerminalConfig {
-        canvas_width: cols as i64,
-        canvas_height: rows as i64,
-        // The live ceiling is applied per frame in `pace_to_cap`.
-        frame_rate: (60.0 * speed_multiplier(cfg.speed)).round().clamp(1.0, 60.0) as i64,
-        ignore_terminal_dimensions: true,
-        ..TerminalConfig::default()
-    };
+    let config = direct_catalog_terminal_config(cols, rows, cfg.speed, literal_input.is_some());
     // Explicit measurement seed only; usual sessions retain entropy.
     let measurement_seed = frame_cadence::enabled_from_env()
         .then(|| {
@@ -4199,6 +4214,29 @@ type SharedGen = std::sync::Arc<std::sync::atomic::AtomicU64>;
 type SharedStop = std::sync::Arc<std::sync::atomic::AtomicBool>;
 type FailedQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
+fn preview_catalog_input(ambient: bool, cols: usize, rows: usize) -> String {
+    if ambient { read_config().ttfx_text }
+    else { wordmark::wordmark_input("OMARCHY", cols, rows, "native", 2.0) }
+}
+#[cfg(test)]
+mod ambient_preview_tests {
+    use super::*;
+    #[test]
+    fn diagonal_glyph_survives_preview_json_transport() {
+        let mut escaped=String::new();json_push_escaped_char(&mut escaped,'\\');
+        let wire=format!("{{\"cells\":\"0,0,{},#ffffff;\"}}",escaped);
+        let value:serde_json::Value=serde_json::from_str(&wire).unwrap();
+        assert_eq!(value["cells"],"0,0,\\,#ffffff;");
+    }
+    #[test]
+    fn literal_branding_is_not_resampled_to_preview_grid() {
+        let text="  A██B  \n C   D \n".to_string();
+        let config=Config{ttfx_text:text.clone(),..Config::default()};
+        let _policy=standalone_config::enter(config,Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        for (w,h) in [(80,24),(174,50),(232,66)] {assert_eq!(preview_catalog_input(true,w,h),text);}
+    }
+}
+
 // One effect session: renders on a headless Screen until the stop flag rises.
 fn preview_worker(
     fx: String,
@@ -4208,8 +4246,42 @@ fn preview_worker(
     gen: SharedGen,
     stop: SharedStop,
     failed: FailedQueue,
+    audio: AudioState,
+    ambient: bool,
 ) {
     use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    use rand::SeedableRng;
+    let cfg=Config{audio:ambient,ttfx_text:std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config/omarchy/branding/screensaver.txt")).unwrap_or_else(|_|"OMARCHY".into()),..Config::default()};
+    let _policy=ambient.then(||standalone_config::enter(cfg,stop.clone()));
+    if ambient {set_auto_degrade_enabled(false);}
+    if ambient && (fx=="matrix-reactive" || fx=="eye-reactive" || fx=="tunnel-reactive" || neon_scenes::Style::parse(&fx).is_some()) {
+        let pointer=Arc::new(interactive_matrix::PointerState::default());
+        let tracker=interactive_matrix::track_global(pointer.clone(),stop.clone(),None,fx=="eye-reactive").ok();
+        let mut rng=rand::rngs::StdRng::from_entropy();
+        let mut rain=interactive_matrix::Rain::new(cols,rows,1.75,&mut rng);
+        rain.reactive_speed=interactive_matrix::reactive_motion();
+        let mut scene=neon_scenes::Style::parse(&fx).map(neon_scenes::Scene::new);let mut tunnel=interactive_tunnel::Tunnel::new();let mut eye=interactive_eye::Eye::new();let mut eye_response=interactive_eye::AudioResponse::default();let mut matrix_drive=interactive_matrix::Sound::default();let mut frame=vec![];let mut last=Instant::now();
+        while !stop.load(Ordering::Acquire) {
+            let now=Instant::now();let dt=(now-last).as_secs_f32().min(0.1);last=now;
+            let level=eye_response.update(&audio,dt);
+            if let Some(scene)=scene.as_mut() {scene.step(dt,pointer.sample(),interactive_matrix::Sound::sample(&audio));scene.draw(cols,rows,1.75,&mut frame);}
+            else if fx=="matrix-reactive" {matrix_drive.follow(interactive_matrix::Sound::sample(&audio),dt);rain.step(dt,pointer.sample(),matrix_drive,&mut rng,&mut frame);}
+            else if fx=="tunnel-reactive" {tunnel.step(dt,pointer.sample(),interactive_matrix::Sound::sample(&audio));tunnel.draw(cols,rows,1.75,&mut frame);}
+            else {let open=eye.step(dt,pointer.sample(),&mut rng);eye.draw(cols,rows,1.75,open,level,&mut frame);}
+            let mut encoded=String::new();
+            for c in &frame {
+                use std::fmt::Write;
+                let (ch,color)=c.background.map(|b|('█',b)).unwrap_or((c.ch,c.color));
+                let _=write!(encoded,"{},{},",c.x,c.y);
+                json_push_escaped_char(&mut encoded,ch);
+                let _=write!(encoded,",#{:02x}{:02x}{:02x};",color.0,color.1,color.2);
+            }
+            *cells.lock().unwrap()=encoded;gen.fetch_add(1,Ordering::Release);
+            if let Some(rest)=Duration::from_nanos(16_666_667).checked_sub(now.elapsed()){std::thread::sleep(rest);}
+        }
+        if let Some(t)=tracker {let _=t.join();}return;
+    }
     if is_ttfx_effect(&fx) {
         // Catalog effect via the vendored engine; frame strings feed the grid.
         use clap::Parser;
@@ -4217,8 +4289,9 @@ fn preview_worker(
         use ttfx::engine::ctx::{Clock, EngineCtx};
         use ttfx::engine::terminal::TerminalConfig;
         use ttfx::utils::rng::Rng;
-        let fps: i64 = 20;
+        let fps: i64 = if ambient {60} else {20};
         let mut scr = Screen::new_headless(cols, rows, cells, gen, stop.clone());
+        let mut next_frame=std::time::Instant::now();
         'outer: loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -4237,7 +4310,7 @@ fn preview_worker(
             // Tight wordmark block + C anchors: the engine centers it on the
             // effect canvas exactly. (A full-canvas input loses its blank
             // padding to the engine's space-dropping and re-anchoring.)
-            let input = wordmark::wordmark_input("OMARCHY", cols, rows, "native", 2.0);
+            let input = preview_catalog_input(ambient, cols, rows);
             let mut config = TerminalConfig::default();
             config.canvas_width = cols as i64;
             config.canvas_height = rows as i64;
@@ -4276,10 +4349,12 @@ fn preview_worker(
                     Some(frame) => {
                         feed_ttfx_frame(&mut scr, &frame);
                         scr.present();
-                        // The QML side consumes at most ~12fps; rendering the
-                        // catalog faster than that burns CPU on frames nobody
-                        // sees (31% for one effect at 232x66 -> ~15%).
-                        std::thread::sleep(Duration::from_millis(90));
+                        if ambient {
+                            next_frame+=Duration::from_nanos(16_666_667);
+                            let now=std::time::Instant::now();
+                            if next_frame>now {std::thread::sleep(next_frame-now);}
+                            else if now-next_frame>Duration::from_millis(17) {next_frame=now;}
+                        } else {std::thread::sleep(Duration::from_millis(90));}
                     }
                     // Animation finished: rebuild it so the preview loops
                     // continuously instead of freezing on the last frame.
@@ -4301,7 +4376,7 @@ fn preview_worker(
         } else {
             hardcoded_palette(&fx)
         };
-        let state = AudioState::start(false); // previews: no audio capture
+        let state = audio; // Ambient shares one output-monitor analyzer across preview sessions
         let mut scr = Screen::new_headless(cols, rows, cells, gen, stop.clone());
         let res = match fx.as_str() {
             "donut" => fx_donut(
@@ -4367,7 +4442,8 @@ fn daemon_json_num(line: &str, key: &str, default: usize) -> usize {
     digits.parse().unwrap_or(default)
 }
 
-fn run_preview_daemon() -> Result<()> {
+fn run_preview_daemon(ambient: bool) -> Result<()> {
+    let audio=AudioState::start(ambient);
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -4404,7 +4480,7 @@ fn run_preview_daemon() -> Result<()> {
 
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let failed: FailedQueue = Arc::new(Mutex::new(Vec::new()));
-    let budget = Duration::from_millis(83); // ~12fps per effect
+    let budget = if ambient {Duration::from_nanos(16_666_667)} else {Duration::from_millis(83)};
     let stdout = std::io::stdout();
 
     let stop_session = |sessions: &mut HashMap<String, Session>, fx: &str| {
@@ -4436,14 +4512,15 @@ fn run_preview_daemon() -> Result<()> {
                     let cells: SharedCells = Arc::new(Mutex::new(String::new()));
                     let gen: SharedGen = Arc::new(AtomicU64::new(0));
                     let join = std::thread::spawn({
-                        let (fx, stop, cells, gen, failed) = (
+                        let (fx, stop, cells, gen, failed, audio) = (
                             fx.clone(),
                             stop.clone(),
                             cells.clone(),
                             gen.clone(),
                             failed.clone(),
+                            audio.clone(),
                         );
-                        move || preview_worker(fx, cols, rows, cells, gen, stop, failed)
+                        move || preview_worker(fx, cols, rows, cells, gen, stop, failed, audio, ambient)
                     });
                     sessions.insert(
                         fx.clone(),
@@ -4498,12 +4575,12 @@ fn run_preview_daemon() -> Result<()> {
             let mut out = stdout.lock();
             let _ = writeln!(
                 out,
-                "{{\"fx\":\"{fx}\",\"cells\":\"{cells}\",\"w\":{},\"h\":{}}}",
-                sess.w, sess.h
+                "{{\"fx\":\"{fx}\",\"cells\":\"{cells}\",\"w\":{},\"h\":{},\"volume\":{}}}",
+                sess.w, sess.h, audio.volume()
             );
             let _ = out.flush();
         }
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(if ambient {2} else {40}));
     }
 
     let fxs: Vec<String> = sessions.keys().cloned().collect();
