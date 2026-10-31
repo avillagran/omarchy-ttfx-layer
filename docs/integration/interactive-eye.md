@@ -1,7 +1,7 @@
 # Interactive eye
 
 `--interactive-eye` draws a monochrome eye from ASCII glyphs through the existing
-GPU pipeline, on a bottom layer with keyboard `none`, fully click-through. It
+GPU pipeline, as a click-through background or as a screensaver. It
 blinks every 2.8 to 6 seconds, eases its gaze toward the global cursor, also over
 windows and toward adjacent monitors, and drifts between safe screen positions.
 
@@ -16,5 +16,5 @@ are told apart from the eye and never overwrite it.
 
 Feature probe: `--standalone --probe --interactive-eye-probe` returns
 `omarchy-ttfx-layer interactive-eye 1`; the ordinary capability reply is
-unchanged. It rejects interactive Matrix, overlay and exclusive keyboard.
+unchanged. It excludes interactive Matrix.
 Source-specific auto resolution chooses a coarse per-output grid for this scene.
