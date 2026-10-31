@@ -9,7 +9,9 @@ V1/compact/research snapshots and installations remain untouched.
 `omarchy-ttfx-layer --text-file PATH` reads UTF-8 once during option parsing,
 before monitor lookup, signals, frame governor or worker startup. File contents
 are passed directly to the ASM input parser, with no trim, wordmark expansion,
-per-line centering or glyph restyling. Empty input stays empty; a literal
+per-line centering or glyph restyling. The complete artwork block is centered on
+the output using the engine's center canvas/text anchors; its internal alignment
+is preserved. Empty input stays empty; a literal
 `OMARCHY` file stays the seven characters. Engine ANSI parsing, anchoring,
 clipping and animation semantics still apply. It is not a pixel-preserving
 positioning API or file watcher. Text-independent native effects (Matrix/rain)
