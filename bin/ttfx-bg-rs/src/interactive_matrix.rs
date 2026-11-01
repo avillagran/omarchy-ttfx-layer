@@ -201,7 +201,7 @@ pub fn run(cols:usize, rows:usize, aspect:f32, pointer:Arc<PointerState>, snapsh
         rain.step(dt,pointer.sample(),drive,&mut rng,&mut cells);
         { let mut slot=snapshot.lock().unwrap(); if stop.load(Ordering::Acquire) { break; }
           std::mem::swap(&mut *slot,&mut cells); generation.fetch_add(1,Ordering::Release); wakeup.notify()?; }
-        let period=Duration::from_secs_f64(1./crate::max_fps().unwrap_or(60.).clamp(1.,60.));
+        let period=Duration::from_secs_f64(1./crate::max_fps().unwrap_or(60.).clamp(1.,240.));
         if let Some(rest)=period.checked_sub(begin.elapsed()) { std::thread::sleep(rest); }
     }
     Ok(())

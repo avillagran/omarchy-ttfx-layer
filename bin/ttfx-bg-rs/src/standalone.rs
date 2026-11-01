@@ -12,7 +12,7 @@
 //! omarchy-ttfx-layer --output <name> --layer bottom|overlay --keyboard none|exclusive
 //!                    [--effects a,b,c] [--rotate <seconds>] [--fps auto|<n>]
 //!                    [--text <wordmark> | --text-file <UTF-8 path>] [--audio] [--namespace <ns>]
-//!                    [--width <px> --height <px> --scale <n>] [--resolution <1-8|auto>]
+//!                    [--width <px> --height <px> --scale <n>] [--resolution <1-8|auto|auto+n|auto-n>]
 //! ```
 //!
 //! The output size comes from `--width/--height/--scale` (physical pixels),
@@ -69,6 +69,8 @@ pub struct Options {
     pub namespace: String,
     pub size: Option<(i32, i32, f64)>,
     pub resolution: i64,
+    /// Steps finer (+) or coarser (-) than the resolution, chosen by the user.
+    pub density: i32,
 }
 
 fn value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
@@ -168,9 +170,10 @@ pub fn parse(args: &[String]) -> Result<Options> {
             .unwrap_or_else(|| "omarchy-ttfx-layer".into()),
         size,
         resolution: match value(args, "--resolution") {
-            Some("auto") => AUTO_RESOLUTION,
+            Some(v) if v.starts_with("auto") => AUTO_RESOLUTION,
             other => other.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 8),
         },
+        density: value(args, "--resolution").map_or(0, auto_density),
     })
 }
 
@@ -193,6 +196,16 @@ fn hyprland_output_size(output: Option<&str>) -> Result<(i32, i32, f64)> {
 /// Grid for an output: the same cell size the plugin's GPU path picks.
 const AUTO_RESOLUTION: i64 = 0;
 
+/// Each density step changes the cell size by this factor: the grid gains or
+/// loses a third of its columns, enough to see the change at a glance.
+const DENSITY_STEP: f64 = 0.75;
+const MAX_DENSITY: i32 = 4;
+
+/// `auto+2` is two steps finer than auto, `auto-1` one step coarser.
+fn auto_density(value: &str) -> i32 {
+    value.strip_prefix("auto").and_then(|n| n.parse().ok()).unwrap_or(0).clamp(-MAX_DENSITY, MAX_DENSITY)
+}
+
 /// The finest grid a screen deserves. Density follows the display scale, so a
 /// Retina panel is not asked for more cells than its GPU and CPU can move, and
 /// a very wide output is capped: the renderer's cost follows the grid's size.
@@ -208,10 +221,10 @@ fn auto_resolution(width: i32, scale: f64) -> i64 {
         .clamp(1, 8)
 }
 
-fn grid_for(width: i32, height: i32, scale: f64, resolution: i64) -> (usize, usize, f64, f32) {
+fn grid_for(width: i32, height: i32, scale: f64, resolution: i64, density: i32) -> (usize, usize, f64, f32) {
     let logical = ((width as f64 / scale).round() as i32, (height as f64 / scale).round() as i32);
     let integer_scale = scale.ceil().max(1.0);
-    let cell_px = (9.0 / integer_scale * resolution as f64).max(3.0);
+    let cell_px = (9.0 / integer_scale * resolution as f64 * DENSITY_STEP.powi(density)).max(3.0);
     let font = pango::FontDescription::from_string(&format!("monospace {cell_px:.0}px"));
     let font_size = font.size() as f64 / pango::SCALE as f64;
     let context = pangocairo::FontMap::new().create_context();
@@ -266,7 +279,15 @@ pub fn run(args: &[String]) -> Result<()> {
     let mode = fps_governor::parse_mode(
         opts.fps.as_deref().or(std::env::var("TTFX_BG_MAX_FPS").ok().as_deref()).or(Some("auto")),
     );
-    fps_governor::start(mode, |line| log_dbg(&line));
+    let scene = value(args, "--neon-scene").map(str::to_string).unwrap_or_else(|| {
+        if opts.interactive_matrix { "interactive-matrix".into() }
+        else if opts.interactive_eye { "interactive-eye".into() }
+        else if opts.interactive_tunnel { "interactive-tunnel".into() }
+        else { opts.effects.join("-") }
+    });
+    // Cells grow with the square of the density the user chose.
+    let work = DENSITY_STEP.powi(-2 * opts.density.max(0));
+    fps_governor::start_remembering(mode, fps_governor::memory_path(&scene), work, |line| log_dbg(&line));
 
     let (width, height, scale) = match opts.size {
         Some(size) => size,
@@ -277,7 +298,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         opts.resolution
     };
-    let (cols, rows, cell_px, cell_aspect) = grid_for(width, height, scale, resolution);
+    let (cols, rows, cell_px, cell_aspect) = grid_for(width, height, scale, resolution, opts.density);
     let cfg = Config {
         effects: opts.effects.clone(),
         audio: opts.audio,
@@ -427,6 +448,11 @@ mod tests {
         assert_eq!(auto_resolution(3840, 2.0), 2);
         assert_eq!(auto_resolution(2880, 1.5), 2);
         assert!(parse(&args(&["--neon-scene", "neon-city", "--resolution", "auto"])).is_ok());
+        let finer = parse(&args(&["--neon-scene", "neon-city", "--resolution", "auto+2"])).unwrap();
+        assert_eq!((finer.resolution, finer.density), (AUTO_RESOLUTION, 2));
+        assert_eq!(auto_density("auto-1"), -1);
+        assert_eq!(auto_density("auto+9"), MAX_DENSITY);
+        assert_eq!(auto_density("auto"), 0);
     }
     #[test]
     fn capabilities_precede_probe_and_all_startup_work() {

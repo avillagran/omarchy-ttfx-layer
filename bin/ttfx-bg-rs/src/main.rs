@@ -4454,6 +4454,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
         gen: SharedGen,
         last_gen: u64,
         last_emit: std::time::Instant,
+        budget: Duration,
         w: usize,
         h: usize,
         join: Option<std::thread::JoinHandle<()>>,
@@ -4507,6 +4508,9 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
                     // integer pitch (crisp, like the fullscreen backend).
                     let cols = daemon_json_num(&line, "cols", 60).clamp(10, 260);
                     let rows = daemon_json_num(&line, "rows", 20).clamp(8, 80);
+                    // A slow shell asks for fewer frames than it cannot paint.
+                    let fps = daemon_json_num(&line, "fps", 0);
+                    let budget = if fps > 0 {Duration::from_secs_f64(1.0 / fps.min(60) as f64)} else {budget};
                     stop_session(&mut sessions, &fx);
                     let stop: SharedStop = Arc::new(AtomicBool::new(false));
                     let cells: SharedCells = Arc::new(Mutex::new(String::new()));
@@ -4530,6 +4534,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
                             gen,
                             last_gen: 0,
                             last_emit: std::time::Instant::now() - budget,
+                            budget,
                             w: cols,
                             h: rows,
                             join: Some(join),
@@ -4565,7 +4570,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
         // Emit changed frames within the per-effect budget.
         for (fx, sess) in sessions.iter_mut() {
             let g = sess.gen.load(Ordering::Relaxed);
-            if g == sess.last_gen || sess.last_emit.elapsed() < budget {
+            if g == sess.last_gen || sess.last_emit.elapsed() < sess.budget {
                 continue;
             }
             let cells = sess.cells.lock().unwrap().clone();

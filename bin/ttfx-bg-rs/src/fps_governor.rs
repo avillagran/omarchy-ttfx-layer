@@ -10,7 +10,12 @@
 //! ceiling must also keep the whole GPU under `TTFX_BG_GPU_BUDGET` (default
 //! 30%): on old laptops compositing each frame costs more GPU than drawing it
 //! costs CPU. A 2015 MacBook Pro lands around 24 fps; a current machine
-//! releases the ceiling up to 60 fps.
+//! releases the ceiling up to 60 fps. The ceiling a scene settled on is
+//! remembered per scene, so the next start skips the climb: short runs such as
+//! a screensaver look right from the first frame on any machine. A finer grid
+//! the user asked for raises the CPU budget by as much as it raises the work,
+//! up to `MAX_BUDGET`. On battery the ceiling drops to the lowest level, and it
+//! comes back when the charger does.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -22,6 +27,8 @@ pub const LEVELS: [f64; 5] = [20.0, 24.0, 30.0, 40.0, 60.0];
 pub const AUTO_START_FPS: f64 = 24.0;
 const DEFAULT_BUDGET: f64 = 0.08;
 const DEFAULT_GPU_BUDGET: f64 = 0.30;
+const MAX_BUDGET: f64 = 0.80;
+const POWER_SUPPLIES: &str = "/sys/class/power_supply";
 /// Step up only when the next level would still sit comfortably inside the
 /// budget, for `UP_PERIODS` periods in a row; step down as soon as the
 /// current one clearly exceeds it. Process CPU time per frame is noisier than
@@ -227,19 +234,94 @@ fn process_cpu_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+fn cache_dir() -> Option<PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(cache.join("omarchy-ttfx-layer"))
+}
+
+/// While this file exists, running scenes draw their frame rate.
+pub fn counter_flag() -> Option<PathBuf> {
+    Some(cache_dir()?.join("show-fps"))
+}
+
+/// True when the machine has a mains supply and none of them is online. A
+/// desktop has none, so it never counts as on battery.
+fn on_battery(supplies: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(supplies) else {
+        return false;
+    };
+    let mut mains = false;
+    for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+        if std::fs::read_to_string(path.join("type")).is_ok_and(|t| t.trim() == "Mains") {
+            if read_number(&path.join("online")) == Some(1.0) {
+                return false;
+            }
+            mains = true;
+        }
+    }
+    mains
+}
+
+/// A chosen limit gives way to the lowest level for as long as the charger is out.
+fn hold_battery_floor(fps: f64) {
+    std::thread::Builder::new()
+        .name("ttfx-fps-power".into())
+        .spawn(move || loop {
+            set_cap(if on_battery(Path::new(POWER_SUPPLIES)) { LEVELS[0] } else { fps });
+            std::thread::sleep(PERIOD);
+        })
+        .expect("spawn fps power watch");
+}
+
+/// Where the ceiling of a scene is kept between runs.
+pub fn memory_path(scene: &str) -> Option<PathBuf> {
+    let name: String = scene.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    Some(cache_dir()?.join(format!("fps-{name}")))
+}
+
+/// A remembered ceiling, ignoring anything that is not one of the levels.
+fn recall(path: &Path) -> Option<f64> {
+    read_number(path).filter(|fps| LEVELS.contains(fps))
+}
+
+fn remember(path: &Path, fps: f64) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{fps:.0}\n"));
+}
+
 /// Apply the mode; in `Auto` this spawns the measuring thread. `log` receives
 /// one line per ceiling change.
 pub fn start(mode: Mode, log: impl Fn(String) + Send + 'static) {
+    start_remembering(mode, None, 1.0, log)
+}
+
+/// `start`, beginning from the ceiling kept in `memory` and updating it.
+/// `work` is how many times more cells than usual each frame carries.
+pub fn start_remembering(mode: Mode, memory: Option<PathBuf>, work: f64, log: impl Fn(String) + Send + 'static) {
     match mode {
         Mode::Unlimited => CAP_MILLI.store(0, Ordering::Relaxed),
-        Mode::Fixed(fps) => set_cap(fps),
+        Mode::Fixed(fps) => {
+            set_cap(fps);
+            if fps > LEVELS[0] {
+                hold_battery_floor(fps);
+            }
+        }
         Mode::Auto => {
-            set_cap(AUTO_START_FPS);
-            let budget = budget_from_env("TTFX_BG_CPU_BUDGET", DEFAULT_BUDGET);
+            let supplies = Path::new(POWER_SUPPLIES);
+            let mut battery = on_battery(supplies);
+            let remembered = |memory: &Option<PathBuf>| memory.as_deref().and_then(recall).unwrap_or(AUTO_START_FPS);
+            let first = if battery { LEVELS[0] } else { remembered(&memory) };
+            set_cap(first);
+            let budget = budget_from_env("TTFX_BG_CPU_BUDGET", (DEFAULT_BUDGET * work.max(1.0)).min(MAX_BUDGET));
             let gpu_budget = budget_from_env("TTFX_BG_GPU_BUDGET", DEFAULT_GPU_BUDGET);
             let meter = GpuMeter::find(Path::new("/sys/class/drm"));
             log(format!(
-                "fps governor: auto, budget {:.1}% of one core{}, starting at {AUTO_START_FPS} fps",
+                "fps governor: auto, budget {:.1}% of one core{}, starting at {first} fps",
                 budget * 100.0,
                 meter.as_ref().map_or(String::new(), |m| format!(" and {:.0}% of the GPU ({})", gpu_budget * 100.0, m.describe()))
             ));
@@ -268,6 +350,17 @@ pub fn start(mode: Mode, log: impl Fn(String) + Send + 'static) {
                         last_ticks = ticks;
                         let gpu_busy = gpu.as_mut().and_then(GpuSampler::take);
                         periods += 1;
+                        let unplugged = on_battery(supplies);
+                        if unplugged != battery {
+                            battery = unplugged;
+                            let cap = if battery { LEVELS[0] } else { remembered(&memory) };
+                            up_streak = 0;
+                            set_cap(cap);
+                            log(format!("fps governor: {} power, {cap} fps", if battery { "battery" } else { "mains" }));
+                        }
+                        if battery {
+                            continue;
+                        }
                         // Paused (covered, locked, screen off) or still warming up: no data.
                         if periods <= WARMUP_PERIODS || d_ticks < MIN_TICKS_PER_PERIOD {
                             continue;
@@ -292,6 +385,9 @@ pub fn start(mode: Mode, log: impl Fn(String) + Send + 'static) {
                         if (next - current).abs() >= 0.5 {
                             up_streak = 0;
                             set_cap(next);
+                            if let Some(path) = memory.as_deref() {
+                                remember(path, next);
+                            }
                             log(format!(
                                 "fps governor: {current:.0} -> {next:.0} fps ({cpu_cost:.0} us/frame, {:.1}% cpu{} over {d_ticks} frames; affordable cpu {:.0} gpu {:.0})",
                                 d_cpu as f64 / PERIOD.as_micros() as f64 * 100.0,
@@ -320,6 +416,39 @@ mod tests {
         assert_eq!(parse_mode(Some("0")), Mode::Unlimited);
         assert_eq!(parse_mode(Some("nope")), Mode::Unlimited);
         assert_eq!(parse_mode(Some("1000")), Mode::Fixed(240.0));
+    }
+
+    #[test]
+    fn only_an_offline_charger_means_battery() {
+        let dir = std::env::temp_dir().join(format!("ttfx-power-{}", std::process::id()));
+        let supply = |name: &str, kind: &str, online: &str| {
+            let path = dir.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("type"), kind).unwrap();
+            std::fs::write(path.join("online"), online).unwrap();
+        };
+        assert!(!on_battery(&dir), "no supplies directory");
+        supply("usb", "USB", "1");
+        std::fs::create_dir_all(dir.join("bat")).unwrap();
+        std::fs::write(dir.join("bat/type"), "Battery\n").unwrap();
+        assert!(!on_battery(&dir), "a desktop has no mains supply");
+        supply("ac", "Mains", "0\n");
+        assert!(on_battery(&dir));
+        supply("ac", "Mains", "1\n");
+        assert!(!on_battery(&dir));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_ceiling_survives_between_runs_only_when_it_is_a_level() {
+        let dir = std::env::temp_dir().join(format!("ttfx-fps-memory-{}", std::process::id()));
+        let path = dir.join("nested").join("fps-neon-city");
+        assert_eq!(recall(&path), None);
+        remember(&path, 60.0);
+        assert_eq!(recall(&path), Some(60.0));
+        std::fs::write(&path, "57\n").unwrap();
+        assert_eq!(recall(&path), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -350,16 +350,72 @@ pub struct LayerSpec {
     pub show_fps: bool,
 }
 
-/// "FPS nn" in the bottom-left cells, like the GTK label it replaces.
-fn fps_cells(text: &str, rows: usize) -> impl Iterator<Item = DirectCell> + '_ {
-    text.chars().enumerate().map(move |(x, ch)| DirectCell {
+/// Below this height in logical pixels a cell cannot carry a legible character.
+const COUNTER_MIN_CELL: f64 = 10.0;
+/// Side of one dot of the drawn counter in logical pixels, whatever the grid.
+const COUNTER_DOT: f64 = 3.0;
+const COUNTER_GLYPH_ROWS: usize = 5;
+
+/// Five rows of three dots each.
+fn counter_glyph(ch: char) -> [u8; COUNTER_GLYPH_ROWS] {
+    match ch {
+        '0' => [7, 5, 5, 5, 7],
+        '1' => [2, 6, 2, 2, 7],
+        '2' => [7, 1, 7, 4, 7],
+        '3' => [7, 1, 3, 1, 7],
+        '4' => [5, 5, 7, 1, 1],
+        '5' => [7, 4, 7, 1, 7],
+        '6' => [7, 4, 7, 5, 7],
+        '7' => [7, 1, 1, 2, 2],
+        '8' => [7, 5, 7, 5, 7],
+        '9' => [7, 5, 7, 1, 7],
+        'F' => [7, 4, 6, 4, 4],
+        'P' => [7, 5, 7, 4, 4],
+        'S' => [7, 4, 7, 1, 7],
+        '-' => [0, 0, 7, 0, 0],
+        _ => [0; COUNTER_GLYPH_ROWS],
+    }
+}
+
+/// Cells per dot of the counter, or None where plain characters read fine.
+fn counter_dot_cells(buffer: (i32, i32), cols: usize, rows: usize, scale: f64) -> Option<(usize, usize)> {
+    let cell = (buffer.0 as f64 / cols.max(1) as f64, buffer.1 as f64 / rows.max(1) as f64);
+    (cell.1 / scale < COUNTER_MIN_CELL).then(|| {
+        let dot = COUNTER_DOT * scale;
+        (((dot / cell.0).round() as usize).max(1), ((dot / cell.1).round() as usize).max(1))
+    })
+}
+
+/// "FPS nn" in the bottom-left corner, sized for the screen rather than the
+/// grid. Returns the cells and the columns and rows they cover.
+fn counter_cells(text: &str, rows: usize, dot: Option<(usize, usize)>) -> (Vec<DirectCell>, usize, usize) {
+    let cell = |x, y, lit: Option<char>| DirectCell {
         x,
-        y: rows.saturating_sub(1),
-        ch,
+        y,
+        ch: lit.unwrap_or(' '),
         color: (0xee, 0xee, 0xee),
         background: Some((0, 0, 0)),
         attrs: 0,
-    })
+    };
+    let bottom = rows.saturating_sub(1);
+    let Some((dot_cols, dot_rows)) = dot else {
+        let cells = text.chars().enumerate().map(|(x, ch)| cell(x, bottom, Some(ch))).collect();
+        return (cells, text.chars().count(), 1);
+    };
+    let glyphs: Vec<_> = text.chars().map(counter_glyph).collect();
+    let width = (glyphs.len() * 4 + 1) * dot_cols;
+    let height = (COUNTER_GLYPH_ROWS + 2) * dot_rows;
+    let top = rows.saturating_sub(height);
+    let mut cells = Vec::with_capacity(width * height);
+    for y in 0..height.min(rows) {
+        for x in 0..width {
+            let (dot_x, dot_y) = (x / dot_cols, y / dot_rows);
+            let lit = dot_x >= 1 && (dot_x - 1) % 4 < 3 && (1..=COUNTER_GLYPH_ROWS).contains(&dot_y)
+                && glyphs.get((dot_x - 1) / 4).is_some_and(|g| g[dot_y - 1] >> (2 - (dot_x - 1) % 4) & 1 == 1);
+            cells.push(cell(x, top + y, lit.then_some('█')));
+        }
+    }
+    (cells, width, height.min(rows))
 }
 
 /// Runs until `stop` is set or the compositor closes the layer.
@@ -435,6 +491,9 @@ pub fn run(
     let mut buffer = (0, 0);
     let mut fps_text = String::from("FPS --");
     let mut fps_meter = (std::time::Instant::now(), 0u32);
+    let counter_flag = crate::fps_governor::counter_flag();
+    let mut show_fps = spec.show_fps;
+    let mut counter_checked = std::time::Instant::now();
     let mut frame: Vec<DirectCell> = Vec::new();
     // Damage of recent frames, newest first; None = the whole surface.
     const AGE_HISTORY: usize = 4;
@@ -488,7 +547,13 @@ pub fn run(
                             "duration_us":tc.elapsed().as_micros() as u64}));
                     }
                     dirty |= update.redraw;
-                    if spec.show_fps && update.new_frame {
+                    if counter_checked.elapsed() >= std::time::Duration::from_millis(500) {
+                        counter_checked = std::time::Instant::now();
+                        let wanted = spec.show_fps || counter_flag.as_deref().is_some_and(|flag| flag.exists());
+                        dirty |= wanted != show_fps;
+                        show_fps = wanted;
+                    }
+                    if show_fps && update.new_frame {
                         fps_meter.1 += 1;
                         let elapsed = fps_meter.0.elapsed();
                         if elapsed >= std::time::Duration::from_millis(900) {
@@ -503,10 +568,12 @@ pub fn run(
                     if let Some(pipeline) = pipeline.as_mut() {
                         dirty = false;
                         grid.set_size(buffer.0, buffer.1, scale as f64);
-                        let cells: &[DirectCell] = if spec.show_fps {
+                        let cells: &[DirectCell] = if show_fps {
+                            let dot = counter_dot_cells(buffer, spec.cols, spec.rows, scale as f64);
+                            let (counter, width, height) = counter_cells(&fps_text, spec.rows, dot);
                             frame.clear();
-                            frame.extend(visible.iter().filter(|c| !(c.y + 1 == spec.rows && c.x < fps_text.len())).cloned());
-                            frame.extend(fps_cells(&fps_text, spec.rows));
+                            frame.extend(visible.iter().filter(|c| !(c.y + height >= spec.rows && c.x < width)).cloned());
+                            frame.extend(counter);
                             &frame
                         } else {
                             &visible
@@ -736,5 +803,37 @@ mod damage_policy_tests {
         assert_eq!(parse_damage_policy(Some(" 4 ")), DamagePolicy::Rects(4));
         assert_eq!(parse_damage_policy(Some("0")), DamagePolicy::Rects(1));
         assert_eq!(parse_damage_policy(Some("nonsense")), DamagePolicy::Rects(DEFAULT_MAX_DAMAGE_RECTS));
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    #[test]
+    fn the_counter_keeps_its_size_on_screen_at_any_grid() {
+        // 3456x2234 at scale 2: the auto grid reads as text.
+        assert_eq!(counter_dot_cells((3456, 2234), 320, 100, 2.0), None);
+        let (cols, rows) = counter_dot_cells((3456, 2234), 960, 280, 2.0).unwrap();
+        assert_eq!((cols, rows), (2, 1));
+        let (fine_cols, fine_rows) = counter_dot_cells((3456, 2234), 2400, 800, 2.0).unwrap();
+        assert!(fine_cols > cols && fine_rows > rows);
+    }
+
+    #[test]
+    fn the_drawn_counter_sits_in_the_corner_and_lights_its_digits() {
+        let (cells, width, height) = counter_cells("FPS 1", 100, Some((2, 3)));
+        assert_eq!((width, height), (42, 21));
+        assert_eq!(cells.len(), 42 * 21);
+        assert!(cells.iter().all(|c| c.y >= 79 && c.y < 100 && c.x < 42));
+        let lit = cells.iter().filter(|c| c.ch == '█').count();
+        assert!(lit > 0 && lit % 6 == 0);
+    }
+
+    #[test]
+    fn plain_counter_stays_one_row() {
+        let (cells, width, height) = counter_cells("FPS 60", 100, None);
+        assert_eq!((cells.len(), width, height), (6, 6, 1));
+        assert_eq!(cells[0].y, 99);
     }
 }
