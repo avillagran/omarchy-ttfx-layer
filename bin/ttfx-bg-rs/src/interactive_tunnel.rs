@@ -12,7 +12,62 @@ use std::{
     time::{Duration, Instant},
 };
 
+const TRAIL_PIECE: f32 = 0.5;
+const BIKES: u32 = 3;
+/// Cruising speed of each bike, away from the camera. Being different, they
+/// catch up with each other's trails.
+const BIKE_SPEED: [f32; 3] = [3.8, 4.9, 3.0];
+const BIKE_RUN: f32 = 12.;
+const BIKE_ALIVE: f32 = 9.5;
+const TRAIL_LENGTH: f32 = 14.;
+/// Closer than this across the tunnel and a bike has hit a trail.
+const TRAIL_TOUCH: f32 = 0.34;
+/// A new bike cannot crash yet: it would blow up in the camera's face.
+const BIKE_SAFE_AGE: f32 = 1.2;
+const CRASH_TIME: f32 = 1.5;
+const ROUTE_LANES: [f32; 4] = [-2.2, -1.1, 1.1, 2.2];
+/// Distance a bike holds its lane or moves to the next one.
+const ROUTE_LEG: f32 = 11.;
+const ROUTE_HOLD: f32 = 0.6;
+/// Where a bike is across the tunnel at `distance` along it. The route belongs
+/// to the tunnel, not to the camera: a piece of trail never moves once laid,
+/// and it only bends where the bike changed lane.
+fn bike_route(seed: u32, distance: f32) -> f32 {
+    let lane = |leg: i32| {
+        let h = (leg as u32).wrapping_mul(2654435761) ^ seed.wrapping_mul(40503);
+        ROUTE_LANES[(h.wrapping_mul(2654435761) >> 30) as usize]
+    };
+    let leg = (distance / ROUTE_LEG).floor();
+    let t = ((distance / ROUTE_LEG - leg - ROUTE_HOLD) / (1. - ROUTE_HOLD)).clamp(0., 1.);
+    let (from, to) = (lane(leg as i32), lane(leg as i32 + 1));
+    from + (to - from) * t * t * (3. - 2. * t)
+}
+fn bike_color(bike: u32) -> (u8, u8, u8) {
+    if bike == 1 {
+        (255, 150, 25)
+    } else {
+        (65, 245, 255)
+    }
+}
+#[derive(Clone, Copy)]
+struct Rider {
+    seed: u32,
+    run: u32,
+    age: f32,
+    z: f32,
+}
+/// A derezzed bike: where along the tunnel it blew up and what it had laid.
+#[derive(Clone, Copy)]
+struct Crash {
+    run: u32,
+    seed: u32,
+    at: f32,
+    head: f32,
+    tail: f32,
+    x: f32,
+}
 pub(crate) struct Tunnel {
+    crashes: [Option<Crash>; BIKES as usize],
     time: f32,
     travel: f32,
     gaze: (f32, f32),
@@ -24,6 +79,7 @@ pub(crate) struct Tunnel {
 impl Tunnel {
     pub(crate) fn new() -> Self {
         Self {
+            crashes: [None; BIKES as usize],
             time: 0.,
             travel: 0.,
             gaze: (0., 0.),
@@ -56,6 +112,7 @@ impl Tunnel {
             }
             self.serial = self.serial.wrapping_add(1);
         }
+        self.collide();
         let target = pointer
             .map(|(x, y)| ((x - 0.5) * 2., (y - 0.5) * 2.))
             .unwrap_or((0., 0.));
@@ -75,6 +132,56 @@ impl Tunnel {
             cols as f32 * 0.5 + (xx + bend_x - self.gaze.0 * 0.75) * f * aspect / z,
             rows as f32 * 0.5 + (yy + bend_y - self.gaze.1 * 0.45) * f / z,
         )
+    }
+    /// A bike on the track right now, if it is riding and has not crashed.
+    fn rider(&self, bike: u32) -> Option<Rider> {
+        let clock = self.time + bike as f32 * 3.6;
+        let age = clock % BIKE_RUN;
+        let run = (clock / BIKE_RUN) as u32;
+        let crashed = self.crashes[bike as usize].is_some_and(|c| c.run == run);
+        (age <= BIKE_ALIVE && !crashed).then(|| Rider {
+            seed: run.wrapping_mul(3).wrapping_add(bike),
+            run,
+            age,
+            z: 0.7 + age * BIKE_SPEED[bike as usize],
+        })
+    }
+    /// The first thing a bike touches is another bike's trail: it derezzes.
+    fn collide(&mut self) {
+        for bike in 0..BIKES {
+            let Some(r) = self.rider(bike) else { continue };
+            if r.age < BIKE_SAFE_AGE {
+                continue;
+            }
+            let at = self.travel + r.z;
+            let x = bike_route(r.seed, at);
+            let hit = (0..BIKES).filter(|&o| o != bike).filter_map(|o| self.rider(o)).any(|o| {
+                let inside = r.z <= o.z && r.z >= (o.z - TRAIL_LENGTH).max(0.65);
+                inside && (x - bike_route(o.seed, at)).abs() < TRAIL_TOUCH
+            });
+            if hit {
+                self.crashes[bike as usize] = Some(Crash {
+                    run: r.run,
+                    seed: r.seed,
+                    at: self.time,
+                    head: at,
+                    tail: self.travel + (r.z - TRAIL_LENGTH).max(0.65),
+                    x,
+                });
+            }
+        }
+    }
+    /// A bike's trail: its route between two depths, as screen points close
+    /// enough to show every turn it took.
+    #[allow(clippy::too_many_arguments)]
+    fn trail(&self, seed: u32, y: f32, from: f32, to: f32, cols: usize, rows: usize, aspect: f32) -> Vec<(f32, f32)> {
+        let pieces = ((to - from) / TRAIL_PIECE).ceil().max(1.) as usize;
+        (0..=pieces)
+            .map(|i| {
+                let z = (from + i as f32 * TRAIL_PIECE).min(to);
+                self.project(bike_route(seed, self.travel + z), y, z, cols, rows, aspect)
+            })
+            .collect()
     }
     pub(crate) fn draw(&self, cols: usize, rows: usize, aspect: f32, cells: &mut Vec<DirectCell>) {
         cells.clear();
@@ -235,21 +342,16 @@ impl Tunnel {
             }
         }
         // Light bikes overtake the camera: their depth INCREASES, unlike scenery.
-        for bike in 0..3 {
-            let age = (self.time + bike as f32 * 3.6) % 12.;
-            if age > 9.5 {
+        for bike in 0..BIKES {
+            let Some(Rider { seed, z, .. }) = self.rider(bike) else {
                 continue;
-            }
-            let z = 0.7 + age * 3.8;
-            let lane = if bike % 2 == 0 { -1.65 } else { 1.65 };
-            let color = if bike == 1 {
-                (255, 150, 25)
-            } else {
-                (65, 245, 255)
             };
+            let color = bike_color(bike);
+            let lane_at = |depth: f32| bike_route(seed, self.travel + depth);
             let project = |x, y, z| self.project(x, y, z, cols, rows, aspect);
             // Rear-facing hoop wheels, front/back separation and a low chassis.
             for wheel_z in [z, z + 1.15] {
+                let lane = lane_at(wheel_z);
                 for segment in 0..16 {
                     let a = segment as f32 * std::f32::consts::TAU / 16.;
                     let b = (segment + 1) as f32 * std::f32::consts::TAU / 16.;
@@ -263,41 +365,105 @@ impl Tunnel {
                 }
             }
             for side in [-0.26, 0.26] {
+                let (rear, front) = (lane_at(z), lane_at(z + 1.2));
                 raster.line_with_glyph(
-                    project(lane + side, 1.65, z),
-                    project(lane + side, 1.44, z + 1.2),
+                    project(rear + side, 1.65, z),
+                    project(front + side, 1.44, z + 1.2),
                     z - 0.04,
                     color,
                     true,
                     Some('▬'),
                 );
                 raster.line(
-                    project(lane + side, 1.44, z + 1.2),
-                    project(lane, 1.28, z + 0.55),
+                    project(front + side, 1.44, z + 1.2),
+                    project(lane_at(z + 0.55), 1.28, z + 0.55),
                     z - 0.05,
                     color,
                     true,
                 );
             }
             // Trail remains behind the bike, clipped at the camera near plane.
-            let tail = (z - 14.).max(0.65);
-            raster.line(
-                project(lane, 2.12, tail),
-                project(lane, 2.12, z),
-                tail,
-                (color.0 / 2, color.1 / 2, color.2 / 2),
-                true,
-            );
-            raster.line_with_glyph(
-                project(lane, 1.95, tail),
-                project(lane, 1.95, z),
-                tail,
-                color,
-                false,
-                Some('▌'),
-            );
+            // It is many short pieces so it follows the bends of the tunnel.
+            let tail = (z - TRAIL_LENGTH).max(0.65);
+            for (y, glyph, tint, solid) in [
+                (2.12, None, (color.0 / 2, color.1 / 2, color.2 / 2), true),
+                (1.95, Some('▌'), color, false),
+            ] {
+                let points = self.trail(seed, y, tail, z, cols, rows, aspect);
+                for (i, piece) in points.windows(2).enumerate() {
+                    let near = tail + i as f32 * TRAIL_PIECE;
+                    raster.line_with_glyph(piece[0], piece[1], near, tint, solid, glyph);
+                }
+            }
+        }
+        for bike in 0..BIKES {
+            if let Some(crash) = self.crashes[bike as usize] {
+                self.draw_crash(&mut raster, crash, bike_color(bike), cols, rows, aspect);
+            }
         }
         cells.extend(raster.cells.into_iter().flatten());
+    }
+    /// The bike bursts into shards where it hit, and what it laid falls apart.
+    fn draw_crash(&self, raster: &mut Raster, crash: Crash, color: (u8, u8, u8), cols: usize, rows: usize, aspect: f32) {
+        let t = self.time - crash.at;
+        if !(0. ..CRASH_TIME).contains(&t) {
+            return;
+        }
+        let life = 1. - t / CRASH_TIME;
+        let shade = |c: (u8, u8, u8), k: f32| {
+            (
+                (c.0 as f32 * k).min(255.) as u8,
+                (c.1 as f32 * k).min(255.) as u8,
+                (c.2 as f32 * k).min(255.) as u8,
+            )
+        };
+        let project = |x, y, z| self.project(x, y, z, cols, rows, aspect);
+        let pieces = ((crash.head - crash.tail) / TRAIL_PIECE) as u32;
+        for i in 0..pieces {
+            let z = crash.tail + i as f32 * TRAIL_PIECE - self.travel;
+            let gone = (i.wrapping_mul(2654435761) >> 22) as f32 / 1024.;
+            if z < 0.65 || gone < t * 1.4 {
+                continue;
+            }
+            let (a, b) = (bike_route(crash.seed, z + self.travel), bike_route(crash.seed, z + self.travel + TRAIL_PIECE));
+            raster.line_with_glyph(project(a, 1.95, z), project(b, 1.95, z + TRAIL_PIECE), z, shade(color, life), false, Some('▌'));
+        }
+        let depth = crash.head - self.travel;
+        for i in 0..80u32 {
+            let h = i.wrapping_mul(2654435761);
+            let share = |shift: u32| ((h >> shift) & 255) as f32 / 255. * 2. - 1.;
+            let fly = t * (1.4 + ((h >> 26) & 63) as f32 / 12.);
+            let x = (crash.x + share(2) * fly).clamp(-3.15, 3.15);
+            let y = (1.7 + share(10) * fly - fly * fly * 0.12).clamp(-2.15, 2.15);
+            let z = depth + share(18) * fly * 1.6;
+            if z < 0.7 {
+                continue;
+            }
+            let (px, py) = project(x, y, z);
+            let tint = if i % 3 == 0 { (255, 250, 235) } else { color };
+            let glyph = if t < 0.5 { '#' } else if i % 2 == 0 { '*' } else { '+' };
+            // Shards keep their size on screen at any grid, and loom up close.
+            let size = (rows as f32 / 130. * (6. / z).clamp(0.5, 1.8)) as i32;
+            let wide = (size as f32 * aspect) as i32;
+            for dy in 0..=size {
+                for dx in 0..=wide {
+                    raster.dot(px as i32 + dx - wide / 2, py as i32 + dy - size / 2, z - 0.1, glyph, shade(tint, life * 1.3));
+                }
+            }
+        }
+        if t < 0.35 && depth > 0.7 {
+            let reach = t * 4.5 + 0.2;
+            for segment in 0..24 {
+                let (a, b) = (segment as f32 * 0.2618, (segment + 1) as f32 * 0.2618);
+                raster.line(
+                    project(crash.x + a.cos() * reach, 1.7 + a.sin() * reach * 0.8, depth),
+                    project(crash.x + b.cos() * reach, 1.7 + b.sin() * reach * 0.8, depth),
+                    depth - 0.2,
+                    (255, 250, 235),
+                    true,
+                );
+            }
+        }
     }
 }
 pub(crate) struct Raster {
@@ -469,7 +635,7 @@ pub fn run(
             generation.fetch_add(1, Ordering::Release);
             wakeup.notify()?;
         }
-        let period = Duration::from_secs_f64(1. / crate::max_fps().unwrap_or(60.).clamp(1., 60.));
+        let period = Duration::from_secs_f64(1. / crate::max_fps().unwrap_or(60.).clamp(1., 240.));
         if let Some(rest) = period.checked_sub(begin.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -525,6 +691,91 @@ mod tests {
         }
         assert!(b.sound.bass < 0.001);
     }
+    #[test]
+    fn a_bike_that_touches_a_trail_derezzes_and_none_ride_through_one() {
+        let mut tunnel = Tunnel::new();
+        let mut crashes = 0;
+        let mut seen = [(0.0_f32, 0_u32); BIKES as usize];
+        let frames = 30 * 600;
+        for _ in 0..frames {
+            tunnel.step(1. / 30., None, Sound::default());
+            for bike in 0..BIKES as usize {
+                if let Some(c) = tunnel.crashes[bike] {
+                    if (c.at, c.run) != seen[bike] {
+                        seen[bike] = (c.at, c.run);
+                        crashes += 1;
+                    }
+                }
+            }
+            for bike in 0..BIKES {
+                let Some(r) = tunnel.rider(bike) else { continue };
+                if r.age < BIKE_SAFE_AGE {
+                    continue;
+                }
+                let at = tunnel.travel + r.z;
+                for other in (0..BIKES).filter(|&o| o != bike) {
+                    let Some(o) = tunnel.rider(other) else { continue };
+                    if r.z <= o.z && r.z >= (o.z - TRAIL_LENGTH).max(0.65) {
+                        let gap = (bike_route(r.seed, at) - bike_route(o.seed, at)).abs();
+                        assert!(gap >= TRAIL_TOUCH, "bike {bike} rode through a trail");
+                    }
+                }
+            }
+        }
+        eprintln!("CRASHES {crashes} in 10 minutes");
+        assert!((10..=150).contains(&crashes), "{crashes}");
+    }
+
+    #[test]
+    fn a_crash_bursts_and_clears() {
+        let mut tunnel = Tunnel::new();
+        tunnel.crashes[0] = Some(Crash { run: 0, seed: 1, at: 2., head: 12., tail: 2., x: 1.1 });
+        let shards = |tunnel: &Tunnel| {
+            let mut cells = vec![];
+            tunnel.draw(300, 90, 1.75, &mut cells);
+            cells.iter().filter(|c| matches!(c.ch, '#' | '*' | '+')).count()
+        };
+        tunnel.time = 2.2;
+        assert!(shards(&tunnel) > 10);
+        assert!(tunnel.rider(0).is_none(), "the crashed bike must be gone");
+        tunnel.time = 2.1 + CRASH_TIME;
+        assert_eq!(shards(&tunnel), 0);
+    }
+
+    #[test]
+    fn a_route_holds_its_lane_and_turns_smoothly() {
+        for seed in 0..20 {
+            let mut held = 0;
+            let mut last = bike_route(seed, 0.);
+            for i in 1..4000 {
+                let x = bike_route(seed, i as f32 * 0.05);
+                assert!((x - last).abs() < 0.12, "seed {seed} at {i}");
+                assert!(x.abs() <= 2.2);
+                held += (x == last) as usize;
+                last = x;
+            }
+            assert!(held > 1800, "seed {seed}: {held}");
+        }
+    }
+
+    #[test]
+    fn a_laid_trail_stays_where_the_bike_passed() {
+        let mut tunnel = Tunnel::new();
+        tunnel.travel = 40.;
+        let points = tunnel.trail(7, 1.95, 3., 15., 300, 90, 1.75);
+        assert_eq!(points.len(), 25);
+        // The same stretch of tunnel, a little further along the ride: only
+        // the depth changed, the route under it did not.
+        for z in [3., 8., 14.] {
+            let before = bike_route(7, tunnel.travel + z);
+            tunnel.travel += 2.;
+            assert_eq!(before, bike_route(7, tunnel.travel + z - 2.));
+            tunnel.travel -= 2.;
+        }
+        let expected = tunnel.project(bike_route(7, 43.), 1.95, 3., 300, 90, 1.75);
+        assert_eq!(points[0], expected);
+    }
+
     #[test]
     fn perspective_and_clipping_are_finite() {
         let t = Tunnel::new();
