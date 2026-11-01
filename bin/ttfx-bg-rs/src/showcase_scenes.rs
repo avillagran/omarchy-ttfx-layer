@@ -1,6 +1,6 @@
-//! Six showcase backgrounds: a working terminal, a data globe, a city seen
-//! from above in the rain, an aquarium of jellyfish, a starship cockpit and a
-//! particle hourglass that writes the time. All share the cell raster, the
+//! Showcase backgrounds: a working terminal, a data globe, a fish tank, an
+//! aquarium of jellyfish, a starship cockpit and clocks built from sand. All
+//! share the cell raster, the
 //! global cursor and the bass/treble pair; silence keeps a full animation.
 use crate::{
     asm_direct_bridge::DirectCell, interactive_matrix::Sound, interactive_tunnel::Raster,
@@ -12,10 +12,9 @@ type Color = (u8, u8, u8);
 pub(crate) enum Kind {
     Terminal,
     Globe,
-    CityRain,
+    Aquarium,
     Jellyfish,
     Cockpit,
-    Hourglass,
     SandClock,
     ChladniClock,
     DunesClock,
@@ -26,10 +25,9 @@ impl Kind {
         Some(match name {
             "live-terminal" => Self::Terminal,
             "data-globe" => Self::Globe,
-            "city-rain" => Self::CityRain,
+            "aquarium" => Self::Aquarium,
             "jellyfish" => Self::Jellyfish,
             "cockpit" => Self::Cockpit,
-            "hourglass" => Self::Hourglass,
             "sand-clock" => Self::SandClock,
             "sand-clock-chladni" => Self::ChladniClock,
             "sand-clock-dunes" => Self::DunesClock,
@@ -38,13 +36,12 @@ impl Kind {
         })
     }
     #[cfg(test)]
-    pub(crate) const ALL: [&'static str; 10] = [
+    pub(crate) const ALL: [&'static str; 9] = [
         "live-terminal",
         "data-globe",
-        "city-rain",
+        "aquarium",
         "jellyfish",
         "cockpit",
-        "hourglass",
         "sand-clock",
         "sand-clock-chladni",
         "sand-clock-dunes",
@@ -743,21 +740,6 @@ impl Globe {
         }
     }
 }
-// ------------------------------------------------------------------ city rain
-struct Car {
-    road: usize,
-    pos: f32,
-    dir: f32,
-    speed: f32,
-}
-type CityKey = (i32, i32, usize, usize, u32, u32, u32);
-struct CityRain {
-    cars: Vec<Car>,
-    time: f32,
-    flash: f32,
-    layer: std::cell::RefCell<(CityKey, Vec<(i32, i32, f32, char, Color)>)>,
-    rng: Rng,
-}
 /// Collects a static layer so it can be replayed instead of recomputed.
 struct Bake(Vec<(i32, i32, f32, char, Color)>);
 impl Bake {
@@ -765,311 +747,672 @@ impl Bake {
         self.0.push((x, y, z, ch, color));
     }
 }
-// Variable block sizes repeat over a period so the city never looks tiled.
-const COL_W: [f32; 6] = [44., 30., 58., 36., 50., 32.];
-const ROW_H: [f32; 5] = [18., 11., 24., 14., 20.];
-const STREET: f32 = 5.;
-fn span_at(v: f32, sizes: &[f32]) -> (usize, f32, f32) {
-    let period: f32 = sizes.iter().sum::<f32>() + STREET * sizes.len() as f32;
-    let mut t = v.rem_euclid(period);
-    let lap = (v.div_euclid(period)) as i32;
-    for (i, s) in sizes.iter().enumerate() {
-        if t < s + STREET {
-            return ((lap * 97 + i as i32) as usize, t, *s);
-        }
-        t -= s + STREET;
-    }
-    (0, 0., sizes[0])
+// -------------------------------------------------------------------- aquarium
+// The tank is one unit tall and `width` units wide; cells come only at draw.
+const SURFACE: f32 = 0.07;
+const SAND: f32 = 0.86;
+const SCHOOL: usize = 28;
+const CORAL_Z: f32 = 20.;
+/// From the root of a blade to its tip.
+const WEED: [(Color, Color); 4] = [
+    ((14, 78, 58), (110, 215, 125)),
+    ((10, 88, 92), (85, 225, 195)),
+    ((62, 74, 20), (205, 195, 80)),
+    ((84, 28, 58), (240, 110, 140)),
+];
+/// Where kelp grows, how tall, and which colour.
+const KELP: [(f32, f32, usize); 8] = [
+    (0.035, 0.46, 0),
+    (0.335, 0.3, 2),
+    (0.455, 0.52, 1),
+    (0.55, 0.36, 0),
+    (0.625, 0.44, 3),
+    (0.785, 0.5, 1),
+    (0.885, 0.34, 2),
+    (0.955, 0.54, 0),
+];
+#[derive(Clone, Copy, PartialEq)]
+enum Breed {
+    Tetra,
+    Clown,
+    Tang,
+    Angel,
+    Puffer,
 }
-impl CityRain {
+struct Fish {
+    breed: Breed,
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    /// -1 faces left, 1 right; in between the fish is seen turning.
+    face: f32,
+    wag: f32,
+    size: f32,
+    goal: (f32, f32),
+}
+struct Bubble {
+    x: f32,
+    y: f32,
+    size: f32,
+    phase: f32,
+}
+/// Sand the cursor lifts off the floor.
+struct Dust {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    life: f32,
+}
+/// Direction away from the cursor and how strongly it is felt, 0 outside `radius`.
+fn away(cursor: Option<(f32, f32)>, x: f32, y: f32, radius: f32) -> (f32, f32, f32) {
+    let Some((cx, cy)) = cursor else {
+        return (0., 0., 0.);
+    };
+    let (dx, dy) = (x - cx, y - cy);
+    let d = (dx * dx + dy * dy).sqrt();
+    if d >= radius {
+        return (0., 0., 0.);
+    }
+    let k = 1. - d / radius;
+    (dx / d.max(0.001), dy / d.max(0.001), k * k)
+}
+type AquariumKey = (usize, usize);
+struct Aquarium {
+    fish: Vec<Fish>,
+    bubbles: Vec<Bubble>,
+    dust: Vec<Dust>,
+    /// Where the cursor is in the tank, while there is one.
+    cursor: Option<(f32, f32)>,
+    width: f32,
+    time: f32,
+    lid: f32,
+    /// How swollen the puffer is, from its deflated size up to 1.
+    puffed: f32,
+    last_bass: f32,
+    layer: std::cell::RefCell<(AquariumKey, Vec<(i32, i32, f32, char, Color)>)>,
+    rng: Rng,
+}
+fn sand_top(x: f32) -> f32 {
+    SAND + (x * 2.3).sin() * 0.018 + (x * 5.1 + 1.).sin() * 0.008
+}
+impl Aquarium {
+    const CHEST: f32 = 0.71;
+    const CASTLE: f32 = 0.2;
     fn new() -> Self {
-        let mut rng = Rng(rand::random());
-        let cars = (0..36)
-            .map(|i| Car {
-                road: i % 12,
-                pos: rng.next(),
-                dir: if i % 2 == 0 { 1. } else { -1. },
-                speed: 0.03 + rng.next() * 0.04,
-            })
-            .collect();
         Self {
-            cars,
+            fish: vec![],
+            bubbles: vec![],
+            dust: vec![],
+            cursor: None,
+            width: 1.8,
             time: 0.,
-            flash: 0.,
+            lid: 0.,
+            puffed: 0.,
+            last_bass: 0.,
             layer: Default::default(),
-            rng,
+            rng: Rng(rand::random()),
         }
     }
-    fn step(&mut self, dt: f32, sound: &Sound) {
+    fn stock(&mut self) {
+        let width = self.width;
+        let swimming = [
+            (Breed::Clown, 0.034),
+            (Breed::Clown, 0.028),
+            (Breed::Clown, 0.031),
+            (Breed::Tang, 0.04),
+            (Breed::Tang, 0.033),
+            (Breed::Angel, 0.04),
+            (Breed::Angel, 0.034),
+            (Breed::Puffer, 0.04),
+        ];
+        let tetras = (0..SCHOOL).map(|_| (Breed::Tetra, 0.0085));
+        for (breed, size) in swimming.into_iter().chain(tetras) {
+            let school = breed == Breed::Tetra;
+            let (x, y) = if school {
+                (width * (0.45 + self.rng.next() * 0.15), 0.3 + self.rng.next() * 0.15)
+            } else {
+                (width * (0.1 + self.rng.next() * 0.8), 0.2 + self.rng.next() * 0.5)
+            };
+            let dir = if self.rng.next() < 0.5 { 1. } else { -1. };
+            self.fish.push(Fish {
+                breed,
+                x,
+                y,
+                vx: dir * 0.05,
+                vy: 0.,
+                face: dir,
+                wag: self.rng.next() * TAU,
+                size,
+                goal: (x, y),
+            });
+        }
+    }
+    fn release_bubbles(&mut self, x: f32, y: f32, count: usize) {
+        for _ in 0..count {
+            if self.bubbles.len() < 140 {
+                self.bubbles.push(Bubble {
+                    x: x + (self.rng.next() - 0.5) * 0.03,
+                    y,
+                    size: 0.3 + self.rng.next() * 0.7,
+                    phase: self.rng.next() * TAU,
+                });
+            }
+        }
+    }
+    fn step(&mut self, dt: f32, sound: &Sound, cursor: Option<(f32, f32)>, width: f32) {
         self.time += dt;
-        for c in &mut self.cars {
-            c.pos = (c.pos + c.dir * dt * c.speed * (1. + sound.bass * 1.5)).rem_euclid(1.);
+        self.width = width.max(0.2);
+        self.cursor = cursor.map(|(x, y)| ((x + 1.) * 0.5 * self.width, (y + 1.) * 0.5));
+        if self.fish.is_empty() {
+            self.stock();
         }
-        self.flash = (self.flash - dt * 2.5).max(0.);
-        if sound.treble > 0.55 && self.rng.next() < dt * 1.5 {
-            self.flash = 1.;
+        // The chest answers the beat: it opens and lets its air out.
+        let chest = (self.width * Self::CHEST, SAND - 0.05);
+        let open = (sound.bass * 1.6 - 0.15).max(away(self.cursor, chest.0, chest.1, 0.3).2 * 2.5).clamp(0., 1.);
+        self.lid += (open - self.lid) * (1. - (-dt * 7.).exp());
+        if self.lid > 0.5 && self.rng.next() < dt * 6. {
+            self.release_bubbles(chest.0, chest.1, 1);
+        }
+        if sound.bass > 0.4 && sound.bass > self.last_bass + 0.02 {
+            self.release_bubbles(chest.0, chest.1, 3);
+        }
+        self.last_bass = sound.bass;
+        if self.rng.next() < dt * 2.5 {
+            self.release_bubbles(self.width * (Self::CASTLE + 0.035), SAND - 0.3, 1);
+        }
+        let (time, cursor) = (self.time, self.cursor);
+        for b in &mut self.bubbles {
+            let (ax, ay, k) = away(cursor, b.x, b.y, 0.16);
+            b.y -= dt * (0.09 + b.size * 0.09) - ay * k * dt * 0.5;
+            b.x += (time * 3. + b.phase).sin() * dt * 0.02 + ax * k * dt * 0.5;
+        }
+        self.bubbles.retain(|b| b.y > SURFACE);
+        // Near the floor the cursor stirs the sand up.
+        if let Some((x, y)) = cursor {
+            if y > SAND - 0.14 && self.dust.len() < 90 {
+                for _ in 0..(dt * 50.).ceil() as usize {
+                    let spread = (self.rng.next() - 0.5) * 0.14;
+                    self.dust.push(Dust {
+                        x: x + spread,
+                        y: sand_top((x + spread).max(0.)),
+                        vx: spread * 1.4,
+                        vy: -0.06 - self.rng.next() * 0.1,
+                        life: 1. + self.rng.next(),
+                    });
+                }
+            }
+        }
+        for d in &mut self.dust {
+            d.vy += dt * 0.09;
+            d.x += d.vx * dt;
+            d.y += d.vy * dt;
+            d.life -= dt;
+        }
+        self.dust.retain(|d| d.life > 0. && d.y < SAND + 0.02);
+        self.swim(dt, sound);
+        if let Some(puffer) = self.fish.iter().find(|f| f.breed == Breed::Puffer) {
+            let scared = away(cursor, puffer.x, puffer.y, 0.34).2 * 2.;
+            let wanted = sound.bass.max(scared).min(1.);
+            self.puffed += (wanted - self.puffed) * (1. - (-dt * 6.).exp());
         }
     }
-    fn draw(&self, r: &mut Raster, cols: usize, rows: usize, sound: &Sound, gaze: (f32, f32)) {
-        let pan_x = gaze.0 * cols as f32 * 0.05 + self.time * 1.2;
-        let pan_y = gaze.1 * rows as f32 * 0.05 + self.time * 0.3;
-        let base = 0.75 + self.flash * 0.8;
-        // Streets first, then every block as a solid, outlined building or park.
-        // The city barely changes between frames: rebuild it only when the view
-        // moves a whole cell or the light steps, and replay it otherwise.
-        let (view_x, view_y) = (pan_x.floor(), pan_y.floor());
-        let key = (
-            view_x as i32,
-            view_y as i32,
-            cols,
-            rows,
-            (self.flash * 6.) as u32,
-            (sound.treble * 5.) as u32,
-            (self.time * 3.) as u32,
-        );
-        let mut layer = self.layer.borrow_mut();
-        if layer.0 != key {
-            layer.0 = key;
-            let mut bake = Bake(std::mem::take(&mut layer.1));
-            bake.0.clear();
-            {
-                let r = &mut bake;
-                let (pan_x, pan_y) = (view_x, view_y);
-                for y in 0..rows {
-                    for x in 0..cols {
-                        let wx = x as f32 + pan_x;
-                        let wy = y as f32 + pan_y;
-                        let (ci, fx, bw) = span_at(wx, &COL_W);
-                        let (ri, fy, bh) = span_at(wy, &ROW_H);
-                        let on_street = fx >= bw || fy >= bh;
-                        if on_street {
-                            let ch = if fx >= bw && fy >= bh {
-                                ' '
-                            } else if fx >= bw {
-                                if (fx - bw) as i32 == 2 && (wy as i32) % 2 == 0 {
-                                    '¦'
-                                } else {
-                                    ' '
-                                }
-                            } else if (fy - bh) as i32 == 2 && (wx as i32) % 4 < 2 {
-                                '-'
-                            } else {
-                                ' '
-                            };
-                            if ch != ' ' {
-                                r.dot(
-                                    x as i32,
-                                    y as i32,
-                                    8.,
-                                    ch,
-                                    scale((120, 125, 140), base * 0.8),
-                                );
-                            }
-                            continue;
-                        }
-                        let seed = variant(
-                            (ci as u32).wrapping_mul(2654435761) ^ (ri as u32).wrapping_mul(40503),
-                        );
-                        if seed < 0.16 {
-                            // Park: tree clumps, a pond and winding paths.
-                            let t = noise(wx * 0.3, wy * 0.6);
-                            let pond = ((fx - bw * 0.5) / (bw * 0.25)).powi(2)
-                                + ((fy - bh * 0.5) / (bh * 0.3)).powi(2)
-                                < 1.;
-                            let (ch, c) = if pond {
-                                (
-                                    '~',
-                                    scale(
-                                        (60, 120, 200),
-                                        base * (0.6 + 0.3 * (self.time * 2. + wx).sin().abs()),
-                                    ),
-                                )
-                            } else if t > 0.7 {
-                                ('♣', scale((60, 170, 80), base))
-                            } else if t > 0.58 {
-                                ('"', scale((50, 130, 70), base))
-                            } else if ((wx * 0.3 + wy * 0.5).sin() * 4.).fract().abs() < 0.08 {
-                                ('·', scale((140, 130, 100), base * 0.7))
-                            } else {
-                                (' ', (0, 0, 0))
-                            };
-                            if ch != ' ' {
-                                r.dot(x as i32, y as i32, 9., ch, c);
-                            }
-                            continue;
-                        }
-                        // Building: inset roof with a lit parapet on the top/left edges
-                        // (the light comes from the upper left), roof texture, vents.
-                        let inset = 1.;
-                        let (rx, ry) = (fx - inset, fy - inset);
-                        let (rw, rh) = (bw - 2. * inset, bh - 2. * inset);
-                        if rx < 0. || ry < 0. || rx >= rw || ry >= rh {
-                            continue;
-                        }
-                        let height = 0.3 + seed * 0.7;
-                        let roof = mix((45, 55, 80), (90, 120, 140), height);
-                        let edge_x = rx < 1. || rx >= rw - 1.;
-                        let edge_y = ry < 1. || ry >= rh - 1.;
-                        let lit = rx < 1. || ry < 1.;
-                        let (ch, c) = if edge_x || edge_y {
-                            (
-                                if edge_x && edge_y {
-                                    '+'
-                                } else if edge_y {
-                                    '═'
-                                } else {
-                                    '║'
-                                },
-                                scale(roof, base * if lit { 1.8 } else { 1.1 }),
-                            )
-                        } else {
-                            let s2 = variant(
-                                (ci as u32)
-                                    .wrapping_mul(7)
-                                    .wrapping_add((ri as u32).wrapping_mul(13))
-                                    .wrapping_mul(99991),
-                            );
-                            let unit = ((rx / rw - 0.5) * 2.).abs() < 0.35 + s2 * 0.3
-                                && ((ry / rh - 0.5) * 2.).abs() < 0.3 + s2 * 0.3;
-                            if unit && (rx as i32 + ry as i32 * 2) % 5 == 0 {
-                                (
-                                    '▪',
-                                    scale((255, 215, 130), base * (0.35 + sound.treble * 0.5)),
-                                )
-                            } else if (rx + ry * 3. + s2 * 7.) as i32 % 9 == 0 {
-                                ('·', scale(roof, base * 0.9))
-                            } else {
-                                ('░', scale(roof, base * 0.55))
-                            }
-                        };
-                        r.dot(x as i32, y as i32, 9., ch, c);
+    fn swim(&mut self, dt: f32, sound: &Sound) {
+        let width = self.width;
+        let cursor = self.cursor;
+        let drive = 1. + sound.bass * 0.8;
+        let school: Vec<(f32, f32, f32, f32)> = self
+            .fish
+            .iter()
+            .filter(|f| f.breed == Breed::Tetra)
+            .map(|f| (f.x, f.y, f.vx, f.vy))
+            .collect();
+        let count = school.len().max(1) as f32;
+        let centre = school.iter().fold((0., 0.), |s, f| (s.0 + f.0 / count, s.1 + f.1 / count));
+        let flow = school.iter().fold((0., 0.), |s, f| (s.0 + f.2 / count, s.1 + f.3 / count));
+        let (time, mut goals) = (self.time, vec![]);
+        for _ in 0..self.fish.len() {
+            goals.push((self.rng.next(), self.rng.next()));
+        }
+        for (f, roll) in self.fish.iter_mut().zip(goals) {
+            let (mut ax, mut ay);
+            let top_speed;
+            if f.breed == Breed::Tetra {
+                ax = (centre.0 - f.x) * 0.22 + (flow.0 - f.vx) * 1.2 + (time * 0.23).sin() * 0.05;
+                ay = (centre.1 - f.y) * 0.3 + (flow.1 - f.vy) * 1.2 + (time * 0.37).cos() * 0.03;
+                for &(x, y, _, _) in &school {
+                    let (dx, dy) = (f.x - x, f.y - y);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d > 0. && d < 0.075 {
+                        ax += dx / d * 0.45 * (1. - d / 0.075);
+                        ay += dy / d * 0.7 * (1. - d / 0.075);
+                    }
+                }
+                let (dx, dy, k) = away(cursor, f.x, f.y, 0.22);
+                ax += dx * k * 5.;
+                ay += dy * k * 5.;
+                top_speed = 0.16 * drive * (1. + k * 2.);
+            } else {
+                if (f.goal.0 - f.x).abs() + (f.goal.1 - f.y).abs() < 0.06 {
+                    f.goal = (width * (0.08 + roll.0 * 0.84), SURFACE + 0.1 + roll.1 * (SAND - SURFACE - 0.22));
+                }
+                let (dx, dy) = (f.goal.0 - f.x, f.goal.1 - f.y);
+                let d = (dx * dx + dy * dy).sqrt().max(0.001);
+                ax = dx / d * 0.09;
+                ay = dy / d * 0.05;
+                // A fright also sends it to swim somewhere else.
+                let (fx, fy, k) = away(cursor, f.x, f.y, 0.3);
+                ax += fx * k * 2.2;
+                ay += fy * k * 2.2;
+                if k > 0.05 {
+                    f.goal = (f.x + fx * 0.5, f.y + fy * 0.3);
+                    f.goal.0 = f.goal.0.clamp(0.1, (width - 0.1).max(0.11));
+                    f.goal.1 = f.goal.1.clamp(SURFACE + 0.1, SAND - 0.12);
+                }
+                top_speed = if f.breed == Breed::Puffer { 0.035 + k * 0.05 } else { 0.075 * drive * (1. + k * 3.) };
+            }
+            // The glass and the sand push back before a fish can reach them.
+            let margin = 0.09;
+            ax += ((margin - f.x).max(0.) - (f.x - (width - margin)).max(0.)) * 8.;
+            ay += ((SURFACE + margin - f.y).max(0.) - (f.y - (SAND - margin)).max(0.)) * 8.;
+            f.vx += ax * dt;
+            f.vy += ay * dt;
+            let speed = (f.vx * f.vx + f.vy * f.vy).sqrt();
+            if speed > top_speed {
+                f.vx *= top_speed / speed;
+                f.vy *= top_speed / speed;
+            }
+            f.x = (f.x + f.vx * dt).clamp(0.02, (width - 0.02).max(0.03));
+            f.y = (f.y + f.vy * dt).clamp(SURFACE + 0.02, SAND - 0.02);
+            if f.vx.abs() > 0.008 {
+                f.face += (f.vx.signum() - f.face) * (1. - (-dt * 3.5).exp());
+            }
+            f.wag += dt * (5. + speed * 45.);
+        }
+    }
+    fn bake(&self, out: &mut Bake, cols: usize, rows: usize, aspect: f32) {
+        let height = rows as f32;
+        let across = |x: f32| x / self.width * cols as f32;
+        // Gravel, with a light top and darker depth.
+        for x in 0..cols {
+            let top = (sand_top(x as f32 / cols as f32 * self.width) * height) as i32;
+            for y in top..rows as i32 {
+                let grain = variant((x as u32).wrapping_mul(7919) ^ (y as u32).wrapping_mul(104729));
+                let depth = (y - top) as f32 / (rows as f32 * 0.14);
+                if grain < 0.55 - depth * 0.2 || y == top {
+                    let ch = if y == top { '~' } else if grain < 0.15 { '°' } else if grain < 0.35 { ':' } else { '·' };
+                    let sand = mix((225, 195, 130), (120, 90, 70), depth);
+                    out.dot(x as i32, y, 30., ch, scale(sand, 0.55 + grain * 0.5));
+                }
+            }
+        }
+        // A sunken castle: two towers joined by a wall with a dark gate.
+        let stone = (118, 128, 150);
+        let block = |out: &mut Bake, left: f32, right: f32, top: f32, bottom: f32| {
+            for y in top as i32..bottom as i32 {
+                for x in left as i32..right as i32 {
+                    let brick = (y as f32 / (height * 0.018).max(1.)) as i32;
+                    let seam = (x + brick * 3).rem_euclid(((height * 0.06 * aspect) as i32).max(3)) == 0;
+                    let edge = x == left as i32 || x + 1 == right as i32;
+                    let (ch, k) = if edge { ('█', 1.05) } else if seam { ('│', 0.55) } else { ('▒', 0.95) };
+                    out.dot(x, y, 22., ch, scale(stone, k));
+                }
+            }
+            let tooth = (height * 0.022 * aspect).max(2.);
+            let mut x = left;
+            while x + tooth <= right {
+                for y in 0..(height * 0.018).max(1.) as i32 {
+                    for dx in 0..tooth as i32 {
+                        out.dot(x as i32 + dx, top as i32 - 1 - y, 22., '█', scale(stone, 1.1));
+                    }
+                }
+                x += tooth * 2.;
+            }
+        };
+        let centre = across(self.width * Self::CASTLE);
+        let unit = height * aspect;
+        let ground = SAND * height + height * 0.02;
+        block(out, centre - unit * 0.16, centre - unit * 0.075, height * 0.5, ground);
+        block(out, centre + unit * 0.075, centre + unit * 0.16, height * 0.46, ground);
+        block(out, centre - unit * 0.075, centre + unit * 0.075, height * 0.62, ground);
+        let (gate_w, gate_h) = (unit * 0.04, height * 0.15);
+        for y in (ground - gate_h) as i32..ground as i32 {
+            for x in (centre - gate_w) as i32..=(centre + gate_w) as i32 {
+                let t = (x as f32 - centre) / gate_w;
+                let arch = ground - gate_h * (1. - t * t).max(0.).sqrt();
+                if y as f32 >= arch {
+                    out.dot(x, y, 21., ' ', (0, 0, 0));
+                }
+            }
+        }
+        for (x, y) in [(-0.117, 0.57), (0.117, 0.53)] {
+            let (wx, wy) = (centre + unit * x, height * y);
+            for dy in 0..(height * 0.05) as i32 {
+                for dx in -((unit * 0.008) as i32)..=(unit * 0.008) as i32 {
+                    out.dot(wx as i32 + dx, wy as i32 + dy, 21., '█', (240, 190, 90));
+                }
+            }
+        }
+        // Rocks to break the floor line.
+        for (site, size) in [(0.42, 0.075), (0.5, 0.05), (0.92, 0.09)] {
+            let (cx, cy) = (cols as f32 * site, SAND * height + height * 0.03);
+            let (rw, rh) = (height * size * aspect, height * size);
+            for y in (cy - rh) as i32..cy as i32 {
+                for x in (cx - rw) as i32..(cx + rw) as i32 {
+                    let (u, v) = ((x as f32 - cx) / rw, (y as f32 - cy) / rh);
+                    if u * u + v * v < 1. {
+                        let light = (-v * 0.7 - u * 0.4 + noise(x as f32 * 0.25, y as f32 * 0.5) * 0.4).clamp(0., 1.);
+                        let ch = if light > 0.62 { '▓' } else if light > 0.35 { '▒' } else { '░' };
+                        out.dot(x, y, 24., ch, scale((105, 100, 125), 0.45 + light * 0.75));
                     }
                 }
             }
-            layer.1 = bake.0;
         }
-        for &(x, y, z, ch, color) in &layer.1 {
-            r.dot(x, y, z, ch, color);
-        }
-        drop(layer);
-        // Traffic lights where the streets cross, red/green per crossing.
-        let (px, py) = (pan_x, pan_y);
-        let mut sx = -(px.rem_euclid(1.));
-        let mut xi = 0;
-        while sx < cols as f32 + 60. {
-            let (ci, fx, bw) = span_at(sx + px, &COL_W);
-            let step = bw + STREET - fx;
-            let cross_x = sx + bw - fx;
-            let mut sy = -(py.rem_euclid(1.));
-            while sy < rows as f32 + 30. {
-                let (ri, fy, bh) = span_at(sy + py, &ROW_H);
-                let cross_y = sy + bh - fy;
-                let green = ((self.time * 0.4) + ci.wrapping_add(ri) as f32 * 0.9).sin() > 0.;
-                let c = if green { (80, 240, 120) } else { (255, 70, 70) };
-                r.dot(
-                    (cross_x + 1.) as i32,
-                    (cross_y + 1.) as i32,
-                    6.,
-                    '●',
-                    scale(c, base),
-                );
-                r.dot(
-                    (cross_x + STREET - 2.) as i32,
-                    (cross_y + STREET - 2.) as i32,
-                    6.,
-                    '●',
-                    scale(c, base),
-                );
-                sy += bh + STREET - fy;
-            }
-            sx += step;
-            xi += 1;
-            if xi > 40 {
-                break;
+        // Branching corals: each branch forks twice on a fixed shape.
+        for (site, tint, reach) in [
+            (0.37, (255, 95, 130), 0.11),
+            (0.58, (255, 150, 60), 0.09),
+            (0.84, (200, 90, 230), 0.12),
+            (0.97, (255, 110, 90), 0.08),
+        ] {
+            let x = cols as f32 * site;
+            let mut stack = vec![(x, SAND * height, -PI / 2., height * reach, 0)];
+            while let Some((x, y, angle, length, level)) = stack.pop() {
+                let (ex, ey) = (x + angle.cos() * length * aspect, y + angle.sin() * length);
+                let steps = (length.max(1.) * 2.5) as i32;
+                for i in 0..=steps {
+                    let t = i as f32 / steps.max(1) as f32;
+                    let ch = if level == 3 { '*' } else if angle.cos().abs() < 0.3 { '|' } else if angle.cos() > 0. { '/' } else { '\\' };
+                    out.dot((x + (ex - x) * t) as i32, (y + (ey - y) * t) as i32, CORAL_Z, ch, scale(tint, 0.6 + level as f32 * 0.14));
+                }
+                if level < 3 {
+                    stack.push((ex, ey, angle - 0.55, length * 0.72, level + 1));
+                    stack.push((ex, ey, angle + 0.5, length * 0.68, level + 1));
+                }
             }
         }
-        // Cars run down the street centre lines, with a headlight cone ahead.
-        for c in &self.cars {
-            let head = scale((255, 245, 210), 0.8 + sound.bass * 0.4);
-            let tail = scale((255, 70, 60), 0.7 + sound.bass * 0.5);
-            let beam = scale((255, 240, 180), 0.25);
-            if c.road % 2 == 0 {
-                // Vertical avenue: find the (road/2)-th street column on screen.
-                let n = c.road / 2;
-                let period: f32 = COL_W.iter().sum::<f32>() + STREET * COL_W.len() as f32;
-                let mut xw = 0.;
-                for i in 0..n % COL_W.len() {
-                    xw += COL_W[i] + STREET;
-                }
-                xw += COL_W[n % COL_W.len()] + 1. + (n / COL_W.len()) as f32 * period;
-                let x = (xw - pan_x).rem_euclid(period * 2.);
-                if x >= cols as f32 {
-                    continue;
-                }
-                let x = x as i32 + if c.dir > 0. { 1 } else { 0 };
-                let y = (c.pos * (rows as f32 + 10.)) as i32 - 5;
-                let d = c.dir as i32;
-                r.dot(x, y, 4., '▮', head);
-                r.dot(x, y - d, 4., '▮', scale(head, 0.6));
-                r.dot(x, y - 2 * d, 4., '▮', tail);
-                for k in 1..4 {
-                    r.dot(x, y + d * k, 4.5, '·', scale(beam, 1.2 - k as f32 * 0.3));
-                }
+    }
+    /// One blade of weed: a solid ribbon with a light midrib and ruffled edges,
+    /// or a plain tapering leaf. The current runs up it as a slow wave.
+    #[allow(clippy::too_many_arguments)]
+    fn frond(&self, r: &mut Raster, root: f32, bottom: f32, tall: f32, half: f32, lean: f32, phase: f32, shade: usize, z: f32, ribbon: bool, height: f32, aspect: f32, sound: &Sound) {
+        let (deep, bright) = WEED[shade];
+        let time = self.time;
+        for i in 0..tall as i32 {
+            let t = i as f32 / tall;
+            let sway = (time * 0.8 + phase + t * 3.4).sin() * t.powf(1.3) * height * aspect * (0.03 + sound.bass * 0.035);
+            let x = root + lean * t * t * height * aspect + sway;
+            let wide = if ribbon {
+                let ruffle = 1. + 0.22 * (i as f32 * 0.42 + time * 1.6 + phase).sin();
+                half * (PI * t.powf(0.8)).sin().max(0.1).powf(0.6) * ruffle
             } else {
-                let n = c.road / 2;
-                let period: f32 = ROW_H.iter().sum::<f32>() + STREET * ROW_H.len() as f32;
-                let mut yw = 0.;
-                for i in 0..n % ROW_H.len() {
-                    yw += ROW_H[i] + STREET;
-                }
-                yw += ROW_H[n % ROW_H.len()] + 1. + (n / ROW_H.len()) as f32 * period;
-                let y = (yw - pan_y).rem_euclid(period * 2.);
-                if y >= rows as f32 {
+                half * (1. - t).powf(0.7)
+            }
+            .max(0.5);
+            let y = (bottom - i as f32) as i32;
+            for dx in -(wide.ceil() as i32)..=wide.ceil() as i32 {
+                let u = dx as f32 / wide;
+                if u.abs() > 1. {
                     continue;
                 }
-                let y = y as i32 + if c.dir > 0. { 1 } else { 0 };
-                let x = (c.pos * (cols as f32 + 20.)) as i32 - 10;
-                let d = c.dir as i32;
-                for k in 0..3 {
-                    r.dot(x - d * k, y, 4., '▬', scale(head, 1. - k as f32 * 0.25));
+                let light = 0.5 + 0.75 * (1. - u * u) - u * 0.18;
+                let tone = mix(deep, bright, t * 0.8 + 0.1);
+                let rib = ribbon && u.abs() < 0.14;
+                let vein = (i + dx.abs() * 2).rem_euclid(7) == 0;
+                let (ch, c) = if rib {
+                    ('█', scale(mix(tone, (235, 250, 190), 0.45), light))
+                } else if u.abs() > 0.74 {
+                    ('▒', scale(tone, light))
+                } else if vein {
+                    ('░', scale(tone, light))
+                } else {
+                    ('█', scale(tone, light))
+                };
+                r.dot((x + dx as f32) as i32, y, z, ch, c);
+            }
+        }
+    }
+    fn draw_fish(&self, r: &mut Raster, f: &Fish, depth: f32, cols: usize, rows: usize, aspect: f32) {
+        let height = rows as f32;
+        let (cx, cy) = (f.x / self.width * cols as f32, f.y * height);
+        if f.breed == Breed::Puffer {
+            return self.draw_puffer(r, f, depth, (cx, cy), height, aspect);
+        }
+        let tall = if f.breed == Breed::Angel { 1.5 } else { 1. };
+        let half_h = (f.size * height * tall).max(1.);
+        let turn = f.face.abs().max(0.22);
+        let half_l = (f.size * height * aspect * 1.7 * turn).max(2.);
+        let side = if f.face < 0. { -1. } else { 1. };
+        let bend = (f.size * height * 0.3).max(0.5);
+        let colour = |u: f32, v: f32| -> Color {
+            match f.breed {
+                Breed::Clown => {
+                    let band = (u - 0.42).abs() < 0.11 || (u + 0.2).abs() < 0.11;
+                    let rim = (u - 0.42).abs() < 0.15 || (u + 0.2).abs() < 0.15;
+                    if band { (250, 245, 235) } else if rim { (35, 25, 20) } else { (255, 118, 28) }
                 }
-                r.dot(x - 3 * d, y, 4., '▬', tail);
-                for k in 1..6 {
-                    r.dot(x + d * k, y, 4.5, '·', scale(beam, 1.2 - k as f32 * 0.2));
+                Breed::Tang => {
+                    if v.abs() < 0.4 && u.abs() < 0.75 && (u * 3. + v * 2.).sin() > 0.75 { (15, 20, 50) } else { (35, 95, 235) }
+                }
+                Breed::Angel => {
+                    if (u * 7.5).sin() > 0.62 { (30, 28, 34) } else { mix((250, 225, 120), (205, 215, 225), v.abs()) }
+                }
+                _ => if v > 0.05 && u < 0.45 { (255, 55, 70) } else { (70, 225, 255) },
+            }
+        };
+        let columns = (half_l * 1.42) as i32;
+        for i in -columns..=(half_l as i32) {
+            let u = i as f32 / half_l;
+            let sway = (f.wag - u * 2.4).sin() * bend * (1. - u) * 0.5;
+            let x = (cx + side * i as f32) as i32;
+            if u < -1. {
+                // The tail spreads from the end of the body.
+                let spread = half_h * 0.95 * (-u - 1.) / 0.42;
+                let tail = if f.breed == Breed::Tang { (250, 215, 55) } else { scale(colour(-0.9, 0.), 0.85) };
+                for y in (-spread) as i32..=spread as i32 {
+                    let ch = if y.abs() as f32 >= spread - 1. { if (y as f32) < 0. { '/' } else { '\\' } } else { '=' };
+                    let ch = match (side < 0., ch) { (true, '/') => '\\', (true, '\\') => '/', (_, c) => c };
+                    r.dot(x, (cy + sway + y as f32) as i32, depth, ch, tail);
+                }
+                continue;
+            }
+            let shape = (1. - u * u).max(0.).sqrt() * (1. + u * 0.18);
+            let half = half_h * shape;
+            let top = (-half).floor() as i32;
+            for y in top..=half.ceil() as i32 {
+                let v = y as f32 / half.max(1.);
+                if v.abs() > 1. {
+                    continue;
+                }
+                let light = 1.08 - (v + 0.35).abs() * 0.5;
+                let ch = if v.abs() > 0.85 {
+                    '▓'
+                } else if (i + y * 3).rem_euclid(5) == 0 {
+                    if side > 0. { ')' } else { '(' }
+                } else {
+                    '█'
+                };
+                r.dot(x, (cy + sway + y as f32) as i32, depth, ch, scale(colour(u, v), light));
+            }
+            // Dorsal and belly fins follow the body and ripple with it.
+            let fin_top = if f.breed == Breed::Angel { 0.7 } else { 0.42 };
+            if u.abs() < 0.62 {
+                let reach = half_h * fin_top * (1. - (u / 0.62).powi(2)) * (0.8 + (f.wag + u * 6.).sin() * 0.2);
+                for y in 1..=reach as i32 {
+                    r.dot(x, (cy + sway - half - y as f32) as i32, depth + 0.1, '^', scale(colour(u, -1.), 0.7));
+                    if f.breed == Breed::Angel {
+                        r.dot(x, (cy + sway + half + y as f32) as i32, depth + 0.1, 'v', scale(colour(u, 1.), 0.7));
+                    }
                 }
             }
         }
-        // Rain: diagonal streaks, denser with treble, splashes on roofs.
-        let drops = 180 + (sound.treble * 260.) as usize;
-        for i in 0..drops {
-            let h = (i as u32).wrapping_mul(2654435761);
-            let sx = ((h >> 5) & 4095) as f32 / 4096. * (cols as f32 + 20.);
-            let speed = 28. + ((h >> 17) & 255) as f32 / 255. * 18.;
-            let sy = (self.time * speed + ((h >> 20) & 4095) as f32) % (rows as f32 + 6.) - 3.;
-            let x = sx - sy * 0.35 - 10.;
-            if x >= 0. && x < cols as f32 && sy >= 0. && sy < rows as f32 {
-                r.dot(
-                    x as i32,
-                    sy as i32,
-                    3.,
-                    '╱',
-                    scale((175, 210, 245), 0.6 + sound.treble * 0.4 + self.flash * 0.5),
-                );
+        if turn > 0.45 {
+            let (ex, ey) = (cx + side * half_l * 0.6, cy - half_h * 0.22);
+            r.dot(ex as i32, ey as i32, depth - 0.2, '●', (250, 250, 250));
+            if half_l > 6. {
+                r.dot((ex + side) as i32, ey as i32, depth - 0.3, '•', (10, 10, 20));
             }
-            if i % 3 == 0 {
-                let ty = ((h >> 9) & 4095) as f32 / 4096. * rows as f32;
-                let tx = ((h >> 21) & 2047) as f32 / 2048. * cols as f32;
-                let life = (self.time * 3. + i as f32 * 0.37).fract();
-                if life < 0.25 {
-                    r.dot(
-                        tx as i32,
-                        ty as i32,
-                        2.5,
-                        if life < 0.12 { '°' } else { 'o' },
-                        scale((170, 200, 230), 0.5 - life),
-                    );
+        }
+    }
+    fn draw_puffer(&self, r: &mut Raster, f: &Fish, depth: f32, (cx, cy): (f32, f32), height: f32, aspect: f32) {
+        // The beat fills it with water and it deflates between hits.
+        let radius = (f.size * height * (1. + self.puffed * 0.95)).max(1.5);
+        let side = if f.face < 0. { -1. } else { 1. };
+        for y in (-radius) as i32 - 1..=radius as i32 + 1 {
+            let reach = radius * aspect;
+            for x in (-reach) as i32 - 2..=reach as i32 + 2 {
+                let (u, v) = (x as f32 / reach, y as f32 / radius);
+                let d = (u * u + v * v).sqrt();
+                let (px, py) = ((cx + x as f32) as i32, (cy + y as f32) as i32);
+                if d < 1. {
+                    let belly = v > 0.25;
+                    let spot = !belly && noise(u * 4. + f.x * 0., v * 4.) > 0.68;
+                    let c = if belly { (245, 240, 215) } else if spot { (120, 90, 30) } else { (240, 190, 55) };
+                    r.dot(px, py, depth, if d > 0.82 { '▓' } else { '█' }, scale(c, 1.05 - d * 0.3));
+                } else if d < 1.28 && (((v.atan2(u) * 11.).sin()) > 0.75) {
+                    r.dot(px, py, depth + 0.1, '*', scale((240, 200, 90), 0.8));
                 }
             }
+        }
+        let tail = (cx - side * radius * aspect * 1.25) as i32;
+        for y in -1..=1 {
+            r.dot(tail, (cy + y as f32 + (f.wag).sin()) as i32, depth, '#', (240, 190, 55));
+        }
+        let (ex, ey) = (cx + side * radius * aspect * 0.5, cy - radius * 0.3);
+        r.dot(ex as i32, ey as i32, depth - 0.2, '●', (250, 250, 250));
+        r.dot((ex + side) as i32, ey as i32, depth - 0.3, '•', (10, 10, 20));
+        r.dot((cx + side * radius * aspect) as i32, (cy + radius * 0.1) as i32, depth - 0.2, 'o', (200, 110, 60));
+    }
+    fn draw(&self, r: &mut Raster, cols: usize, rows: usize, aspect: f32, sound: &Sound) {
+        let height = rows as f32;
+        let time = self.time;
+        {
+            let mut layer = self.layer.borrow_mut();
+            if layer.0 != (cols, rows) {
+                layer.0 = (cols, rows);
+                let mut bake = Bake(std::mem::take(&mut layer.1));
+                bake.0.clear();
+                self.bake(&mut bake, cols, rows, aspect);
+                layer.1 = bake.0;
+            }
+            // The cursor is a lantern on everything that stands still. Corals
+            // only move for the music, swaying from the foot on the bass.
+            let to_tank = self.width / cols.max(1) as f32;
+            for &(x, y, z, ch, color) in &layer.1 {
+                let (tx, ty) = (x as f32 * to_tank, y as f32 / height);
+                let k = away(self.cursor, tx, ty, 0.26).2;
+                let lean = if z == CORAL_Z {
+                    (time * 2.2 + tx * 3.).sin() * sound.bass * (SAND - ty).max(0.) * 0.35 / to_tank
+                } else {
+                    0.
+                };
+                r.dot(x + lean as i32, y, z, ch, if k > 0. { scale(color, 1. + k * 1.7) } else { color });
+            }
+        }
+        // The surface, and light falling through it.
+        for x in 0..cols {
+            let t = x as f32 * 0.03;
+            let wave = (t + time * 0.8).sin() * 0.5 + (t * 2.3 - time * 1.1).sin() * 0.3;
+            // The cursor raises a swell that rings out across the surface.
+            let tx = x as f32 / cols as f32 * self.width;
+            let swell = self.cursor.map_or(0., |(cx, cy)| {
+                let d = (tx - cx).abs();
+                (1. - d / 0.45).max(0.) * (d * 28. - time * 5.).cos() * (1. - cy * 0.8)
+            });
+            let y = SURFACE * height + (wave + swell * 1.6) * (height * 0.012).max(0.6);
+            let glint = 0.5 + ((t * 5. + time * 1.5).sin() * 0.5 + 0.5) * 0.6 + sound.treble * 0.4 + swell.abs() * 0.5;
+            r.dot(x as i32, y as i32, 45., '~', scale((130, 215, 245), glint));
+            if x % 3 != 0 {
+                r.dot(x as i32, y as i32 - 1, 46., '-', scale((70, 150, 200), glint * 0.5));
+            }
+        }
+        for ray in 0..7 {
+            let base = cols as f32 * (ray as f32 + 0.5) / 7. + (time * 0.13 + ray as f32 * 2.).sin() * cols as f32 * 0.04;
+            let lean = (0.26 + ray as f32 * 0.018) * aspect - 0.2;
+            let glow = 0.14 + ((time * 0.4 + ray as f32 * 1.7).sin() * 0.5 + 0.5) * 0.14 + sound.treble * 0.2;
+            let wide = (height * 0.06 * aspect) as i32;
+            let mut y = (SURFACE * height) as i32 + 1;
+            while (y as f32) < SAND * height {
+                let fade = 1. - y as f32 / (SAND * height);
+                for dx in (0..wide).step_by(2) {
+                    let x = base + y as f32 * lean + dx as f32;
+                    let across = 1. - (dx as f32 / wide as f32 * 2. - 1.).abs();
+                    let lit = away(self.cursor, x / cols as f32 * self.width, y as f32 / height, 0.3).2;
+                    if variant((x as u32).wrapping_mul(31) ^ (y as u32).wrapping_mul(977) ^ (time * 2.) as u32) < 0.55 {
+                        r.dot(x as i32, y, 50., '·', scale((120, 205, 235), glow * fade * across * 8. * (1. + lit * 4.)));
+                    }
+                }
+                y += 2;
+            }
+        }
+        // Kelp ribbons stand behind, tufts of eelgrass in front of them.
+        for (i, &(site, tall, shade)) in KELP.iter().enumerate() {
+            let root = cols as f32 * site;
+            let bottom = sand_top(site * self.width) * height + 1.;
+            let (phase, z) = (i as f32 * 1.9, 13. + (i % 4) as f32 * 2.);
+            self.frond(r, root, bottom, height * tall, height * 0.017 * aspect, 0.05, phase, shade, z, true, height, aspect, sound);
+            let beside = root + height * 0.03 * aspect;
+            self.frond(r, beside, bottom, height * tall * 0.68, height * 0.013 * aspect, -0.06, phase + 2., shade, z + 0.5, true, height, aspect, sound);
+        }
+        for tuft in 0..12u32 {
+            let site = variant(tuft * 2654435 + 29);
+            let root = cols as f32 * site;
+            let bottom = sand_top(site * self.width) * height + 1.;
+            for blade in 0..3 {
+                let spread = blade as f32 - 1.;
+                let tall = height * (0.1 + variant(tuft * 97 + blade) * 0.09);
+                self.frond(r, root + spread * height * 0.012 * aspect, bottom, tall, height * 0.006 * aspect, spread * 0.05, tuft as f32 + spread, 0, 7.5 + blade as f32 * 0.1, false, height, aspect, sound);
+            }
+        }
+        // Chest: the lid lifts on the beat and the gold shows.
+        let unit = height * aspect;
+        let (cx, base) = (cols as f32 * Self::CHEST, SAND * height + height * 0.015);
+        let (half, body) = (unit * 0.055, height * 0.055);
+        for y in (base - body) as i32..base as i32 {
+            for x in (cx - half) as i32..(cx + half) as i32 {
+                let strap = ((x as f32 - cx) / half).abs() > 0.82 || (x as f32 - cx).abs() < 1.5;
+                let (ch, c) = if strap { ('█', (205, 165, 60)) } else { ('▒', (125, 72, 38)) };
+                r.dot(x, y, 10., ch, c);
+            }
+        }
+        let lift = self.lid * height * 0.05;
+        if self.lid > 0.08 {
+            for x in (cx - half * 0.8) as i32..(cx + half * 0.8) as i32 {
+                let shine = 0.7 + (x as f32 * 0.9 + time * 7.).sin() * 0.3;
+                r.dot(x, (base - body) as i32, 9., '*', scale((255, 215, 90), shine + sound.treble * 0.4));
+            }
+        }
+        let lid_rows = (height * 0.03).max(1.) as i32;
+        for y in 0..lid_rows {
+            let inset = (y as f32 * aspect * 0.7) as i32;
+            for x in (cx - half) as i32 + (lid_rows - 1 - y).min(inset)..(cx + half) as i32 - (lid_rows - 1 - y).min(inset) {
+                let py = (base - body - lift) as i32 - lid_rows + y;
+                r.dot(x, py, 9.5, '▓', (150, 90, 45));
+            }
+        }
+        for b in &self.bubbles {
+            let (x, y) = ((b.x / self.width * cols as f32) as i32, (b.y * height) as i32);
+            let ch = if b.size > 0.75 { 'O' } else if b.size > 0.45 { 'o' } else { '°' };
+            r.dot(x, y, 5., ch, scale((185, 235, 255), 0.6 + b.size * 0.5 + sound.bass * 0.3));
+        }
+        for d in &self.dust {
+            let (x, y) = ((d.x / self.width * cols as f32) as i32, (d.y * height) as i32);
+            r.dot(x, y, 6., if d.life > 1. { '°' } else { '·' }, scale((225, 195, 130), 0.3 + d.life * 0.4));
+        }
+        for i in 0..70u32 {
+            let (sx, sy) = (variant(i * 37 + 1), variant(i * 91 + 7));
+            let x = sx * cols as f32 + (time * 0.2 + i as f32).sin() * height * 0.05;
+            let y = ((sy + time * 0.006).rem_euclid(1.) * (SAND - SURFACE) + SURFACE) * height;
+            let (ax, ay, k) = away(self.cursor, x / cols as f32 * self.width, y / height, 0.2);
+            let (x, y) = (x + ax * k * height * aspect * 0.15, y + ay * k * height * 0.15);
+            r.dot(x as i32, y as i32, 35., '·', scale((130, 190, 200), 0.3 + sound.treble * 0.5 + k));
+        }
+        // Nearer fish are larger; the school swims behind them.
+        let mut order: Vec<&Fish> = self.fish.iter().collect();
+        order.sort_by(|a, b| a.size.total_cmp(&b.size));
+        for (i, f) in order.iter().enumerate() {
+            self.draw_fish(r, f, 8. - i as f32 * 0.04, cols, rows, aspect);
         }
     }
 }
@@ -1081,6 +1424,10 @@ struct Jelly {
     phase: f32,
     hue: f32,
     drift: f32,
+    /// How startled it is by the cursor, 0 to 1.
+    fright: f32,
+    /// Sideways drag on the tentacles while it flees.
+    trail: f32,
 }
 struct Plankton {
     x: f32,
@@ -1104,6 +1451,8 @@ impl Jellyfish {
                 phase: rng.next() * TAU,
                 hue: i as f32 / 7.,
                 drift: rng.next() - 0.5,
+                fright: 0.,
+                trail: 0.,
             })
             .collect();
         let plankton = (0..140)
@@ -1119,11 +1468,18 @@ impl Jellyfish {
             rng,
         }
     }
-    fn step(&mut self, dt: f32, sound: &Sound, gaze: (f32, f32)) {
+    fn step(&mut self, dt: f32, sound: &Sound, cursor: Option<(f32, f32)>) {
         self.time += dt;
+        let cursor = cursor.map(|(x, y)| ((x + 1.) * 0.5, (y + 1.) * 0.5));
         for j in &mut self.jellies {
+            // Near the cursor it pulses hard, lights up and swims away.
+            let (ax, ay, k) = away(cursor, j.x, j.y, 0.32);
+            j.x += ax * k * dt * 0.3;
+            j.y += ay * k * dt * 0.3;
+            j.fright += ((k * 3.).min(1.) - j.fright) * (1. - (-dt * 5.).exp());
+            j.trail += (-ax * k * 2.5 - j.trail) * (1. - (-dt * 3.).exp());
             // Bell contraction on the bass drives a push upward.
-            j.phase += dt * (0.9 + sound.bass * 1.5);
+            j.phase += dt * (0.9 + sound.bass * 1.5 + j.fright * 7.);
             let push = (j.phase.sin().max(0.)).powi(2);
             j.y -= dt * (0.012 + push * 0.05) / j.size;
             j.x += dt * j.drift * 0.02 + (self.time * 0.3 + j.phase).sin() * dt * 0.01;
@@ -1133,7 +1489,7 @@ impl Jellyfish {
             }
             j.x = j.x.rem_euclid(1.);
         }
-        let (tx, ty) = ((gaze.0 + 1.) * 0.5, (gaze.1 + 1.) * 0.5);
+        let (tx, ty) = cursor.unwrap_or((-9., -9.));
         for (i, p) in self.plankton.iter_mut().enumerate() {
             let k = i as f32;
             // Each mote wanders around its own home and only leans toward the
@@ -1188,7 +1544,7 @@ impl Jellyfish {
             );
             let tint = mix(tint, (255, 180, 220), j.hue * 0.5);
             let depth = 10. - j.size;
-            let bright = 0.45 + j.size * 0.35 + sound.bass * 0.35;
+            let bright = 0.45 + j.size * 0.35 + sound.bass * 0.35 + j.fright * 0.6;
             // Bell: an upper half ellipse of rim glyphs with a lighter inner glow.
             for i in 0..=48 {
                 let a = PI + i as f32 / 48. * PI;
@@ -1239,7 +1595,7 @@ impl Jellyfish {
                     let f = s as f32 / len;
                     let sway =
                         (self.time * 1.4 - f * 5. + j.phase + t as f32).sin() * rw * 0.25 * f;
-                    let x = cx + ox * (1. + f * 0.3) + sway;
+                    let x = cx + ox * (1. + f * 0.3) + sway + j.trail * rw * 1.2 * f * f;
                     let y = cy + s as f32;
                     let ch = if s % 5 == 0 {
                         '°'
@@ -1566,7 +1922,6 @@ impl Cockpit {
         r.dot(hx as i32, hy as i32, 0.2, '+', hud);
     }
 }
-// ------------------------------------------------------------------ hourglass
 const DIGITS: [[&str; 5]; 11] = [
     ["###", "# #", "# #", "# #", "###"],
     ["  #", "  #", "  #", "  #", "  #"],
@@ -1580,441 +1935,12 @@ const DIGITS: [[&str; 5]; 11] = [
     ["###", "# #", "###", "  #", "###"],
     ["   ", " # ", "   ", " # ", "   "],
 ];
-struct Grain {
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-}
-/// Off-screen frame: the glass is painted upright, then blitted rotated.
-struct Cells {
-    cols: usize,
-    rows: usize,
-    cells: Vec<Option<(f32, char, Color)>>,
-}
-impl Cells {
-    fn dot(&mut self, x: i32, y: i32, z: f32, ch: char, color: Color) {
-        if x < 0 || y < 0 || x as usize >= self.cols || y as usize >= self.rows {
-            return;
-        }
-        let cell = &mut self.cells[y as usize * self.cols + x as usize];
-        if cell.map_or(true, |c| z < c.0) {
-            *cell = Some((z, ch, color));
-        }
-    }
-}
-/// Sand as per-column stacks. The top bulb stacks hang from the glass wall
-/// downward toward the neck; the bottom bulb stacks grow up from the floor.
-/// Both obey an angle of repose, so funnels and cones form by themselves.
-struct Hourglass {
-    cols: usize,
-    rows: usize,
-    top: Vec<i32>,
-    bottom: Vec<i32>,
-    falling: Vec<Grain>,
-    time: f32,
-    clock: String,
-    cycle: f32,
-    release: f32,
-    /// Rotation progress 0..1; negative when the glass stands still.
-    flip: f32,
-    /// Sand dropping onto the funnel after a turn, 0..1; negative otherwise.
-    settle: f32,
-    /// Seconds with no grain moving through the neck.
-    idle: f32,
-    floor_cache: Vec<(i32, i32)>,
-    rng: Rng,
-}
-impl Hourglass {
-    fn new() -> Self {
-        Self {
-            cols: 0,
-            rows: 0,
-            top: vec![],
-            bottom: vec![],
-            falling: vec![],
-            time: 0.,
-            clock: String::new(),
-            cycle: 0.,
-            release: 0.,
-            flip: -1.,
-            settle: -1.,
-            idle: 0.,
-            floor_cache: vec![],
-            rng: Rng(rand::random()),
-        }
-    }
-    fn read_clock() -> String {
-        let (h, m, _) = local_hms();
-        format!("{h:02}:{m:02}")
-    }
-    fn geometry(cols: usize, rows: usize, aspect: f32) -> (f32, f32, f32, f32) {
-        let h = rows as f32 * 0.86;
-        let w = (h * 0.5 * aspect).min(cols as f32 * 0.8);
-        (cols as f32 * 0.5, rows as f32 * 0.5, w * 0.5, h * 0.5)
-    }
-    /// Half width of the glass at a given row.
-    fn half(y: f32, cy: f32, hw: f32, hh: f32) -> f32 {
-        let t = ((y - cy).abs() / hh).min(1.);
-        hw * (0.05 + 0.95 * t.powf(1.35))
-    }
-    /// Lowest glass row of the top bulb and the highest of the bottom bulb
-    /// inside the given column, the "floor" for each stack.
-    fn floors(&self, col: usize, _cx: f32, _cy: f32, _hw: f32, _hh: f32) -> (i32, i32) {
-        self.floor_cache[col]
-    }
-    fn compute_floors(col: usize, cx: f32, cy: f32, hw: f32, hh: f32) -> (i32, i32) {
-        let dx = (col as f32 - cx).abs();
-        // Solve half(y) >= dx for the row closest to the neck.
-        let mut top_floor = (cy - 1.) as i32;
-        let mut bottom_floor = (cy + 1.) as i32;
-        for y in (cy - hh) as i32..=(cy) as i32 {
-            if Self::half(y as f32, cy, hw, hh) > dx + 0.5 {
-                top_floor = top_floor.max(y);
-            }
-        }
-        for y in (cy) as i32..=(cy + hh) as i32 {
-            if Self::half(y as f32, cy, hw, hh) > dx + 0.5 {
-                bottom_floor = bottom_floor.min(y);
-                break;
-            }
-        }
-        // Recompute top floor as the lowest inside row (walk down).
-        let mut tf = (cy - hh) as i32 - 1;
-        for y in (cy - hh) as i32..(cy) as i32 {
-            if Self::half(y as f32, cy, hw, hh) > dx + 0.5 {
-                tf = y;
-            }
-        }
-        (tf, bottom_floor)
-    }
-    fn refill(&mut self, cx: f32, cy: f32, hw: f32, hh: f32) {
-        self.cycle = 0.;
-        self.falling.clear();
-        self.top = vec![0; self.cols];
-        self.bottom = vec![0; self.cols];
-        // Fill the top bulb up to a flat surface at 35% from its top.
-        let surface = (cy - hh * 0.8) as i32;
-        for col in 0..self.cols {
-            let (tf, _) = self.floors(col, cx, cy, hw, hh);
-            if tf >= surface {
-                self.top[col] = tf - surface + 1;
-            }
-        }
-    }
-    fn step(&mut self, dt: f32, sound: &Sound, cols: usize, rows: usize, aspect: f32) {
-        self.time += dt;
-        self.cycle += dt;
-        if self.clock.is_empty() || (self.time as u32) % 20 == 0 && self.time.fract() < dt {
-            self.clock = Self::read_clock();
-        }
-        let (cx, cy, hw, hh) = Self::geometry(cols, rows, aspect);
-        if self.cols != cols || self.rows != rows {
-            self.cols = cols;
-            self.rows = rows;
-            self.floor_cache = (0..cols)
-                .map(|c| Self::compute_floors(c, cx, cy, hw, hh))
-                .collect();
-            self.refill(cx, cy, hw, hh);
-        }
-        if self.flip >= 0. {
-            // The whole glass turns 180 degrees with the sand held in place;
-            // only once it stands inverted does gravity take over.
-            self.flip += dt / 2.6;
-            if self.flip >= 1. {
-                self.flip = -1.;
-                self.settle = 0.;
-                self.turn_over();
-            }
-            return;
-        }
-        if self.settle >= 0. {
-            self.settle += dt / 0.7;
-            if self.settle >= 1. {
-                self.settle = -1.;
-                self.cycle = 0.;
-                self.idle = 0.;
-            }
-            return;
-        }
-        let shake = sound.bass * 2. + sound.treble;
-        // Release grains from the neck columns of the top stacks.
-        let neck: Vec<usize> = (0..cols).filter(|&c| (c as f32 - cx).abs() <= 1.).collect();
-        self.release += dt * (28. + shake * 30.);
-        let mut released = false;
-        while self.release >= 1. {
-            self.release -= 1.;
-            let mut best = None;
-            for &c in &neck {
-                if self.top[c] > 0 && best.map_or(true, |b: usize| self.top[c] > self.top[b]) {
-                    best = Some(c);
-                }
-            }
-            if let Some(c) = best {
-                released = true;
-                self.top[c] -= 1;
-                self.falling.push(Grain {
-                    x: c as f32 + (self.rng.next() - 0.5) * 0.6,
-                    y: cy,
-                    vx: (self.rng.next() - 0.5) * (1. + shake * 3.),
-                    vy: 4. + self.rng.next() * 3.,
-                });
-            }
-        }
-        // Angle of repose in both bulbs: a column passes grains to a lower
-        // neighbour when its surface stands more than one cell above it.
-        let passes = 4 + (shake * 6.) as usize;
-        for _ in 0..passes {
-            for col in 1..cols.saturating_sub(1) {
-                let (tf, _) = self.floors(col, cx, cy, hw, hh);
-                if self.top[col] > 0 {
-                    let surf = tf - self.top[col];
-                    for n in [col - 1, col + 1] {
-                        let (nf, _) = self.floors(n, cx, cy, hw, hh);
-                        if nf < (cy - hh) as i32 {
-                            continue;
-                        }
-                        let nsurf = nf - self.top[n];
-                        // Sand flows toward the neck: the deeper hole wins.
-                        if nsurf > surf + 1 && self.top[col] > 0 && self.rng.next() < 0.5 {
-                            self.top[col] -= 1;
-                            self.top[n] += 1;
-                        }
-                    }
-                }
-            }
-            for col in 1..cols.saturating_sub(1) {
-                if self.bottom[col] == 0 {
-                    continue;
-                }
-                let (_, bf) = self.floors(col, cx, cy, hw, hh);
-                let cap = (cy + hh) as i32 - bf;
-                let surf = (cy + hh) as i32 - self.bottom[col];
-                for n in [col - 1, col + 1] {
-                    let (_, nbf) = self.floors(n, cx, cy, hw, hh);
-                    let ncap = (cy + hh) as i32 - nbf;
-                    if ncap <= 0 {
-                        continue;
-                    }
-                    let nsurf = (cy + hh) as i32 - self.bottom[n];
-                    if nsurf > surf + 1 && self.bottom[n] < ncap && self.rng.next() < 0.5 {
-                        self.bottom[col] -= 1;
-                        self.bottom[n] += 1;
-                    }
-                }
-                let _ = cap;
-            }
-        }
-        // Falling grains land on the bottom stacks.
-        let bottom_y = (cy + hh) as i32;
-        let mut landed = vec![];
-        for (i, g) in self.falling.iter_mut().enumerate() {
-            g.vy += dt * 30.;
-            g.vx *= 0.96;
-            g.x += g.vx * dt;
-            g.y += g.vy * dt;
-            let col = (g.x.round() as i32).clamp(0, cols as i32 - 1) as usize;
-            let surf = bottom_y - self.bottom[col];
-            if g.y >= surf as f32 - 0.5 {
-                self.bottom[col] += 1;
-                landed.push(i);
-            }
-        }
-        for i in landed.into_iter().rev() {
-            self.falling.swap_remove(i);
-        }
-        // When the sand stops running, the hourglass turns itself over.
-        if released || !self.falling.is_empty() {
-            self.idle = 0.;
-        } else {
-            self.idle += dt;
-            if self.idle > 1.2 {
-                self.flip = 0.;
-            }
-        }
-    }
-    /// After 180 degrees each bulb is the other one, mirrored left to right.
-    fn turn_over(&mut self) {
-        let cols = self.cols;
-        let mut top = vec![0; cols];
-        let mut bottom = vec![0; cols];
-        for col in 0..cols {
-            let m = (cols - col).min(cols - 1);
-            top[m] += self.bottom[col];
-            bottom[m] += self.top[col];
-        }
-        self.top = top;
-        self.bottom = bottom;
-    }
-    fn draw(&self, r: &mut Raster, cols: usize, rows: usize, aspect: f32, sound: &Sound) {
-        let (cx, cy, _, _) = Self::geometry(cols, rows, aspect);
-        let mut frame = Cells {
-            cols,
-            rows,
-            cells: vec![None; cols * rows],
-        };
-        self.paint(&mut frame, cols, rows, aspect, sound);
-        if self.flip < 0. {
-            for y in 0..rows {
-                for x in 0..cols {
-                    if let Some((z, ch, color)) = frame.cells[y * cols + x] {
-                        r.dot(x as i32, y as i32, z, ch, color);
-                    }
-                }
-            }
-            return;
-        }
-        // Rotate in screen space, sampling backwards so no holes appear.
-        let t = self.flip;
-        let eased = t * t * (3. - 2. * t);
-        let (sin, cos) = (eased * PI).sin_cos();
-        for y in 0..rows {
-            for x in 0..cols {
-                let dx = (x as f32 - cx) / aspect;
-                let dy = y as f32 - cy;
-                let sx = (cx + (dx * cos + dy * sin) * aspect).round() as i32;
-                let sy = (cy - dx * sin + dy * cos).round() as i32;
-                if sx < 0 || sy < 0 || sx as usize >= cols || sy as usize >= rows {
-                    continue;
-                }
-                if let Some((z, ch, color)) = frame.cells[sy as usize * cols + sx as usize] {
-                    // Slanted glyphs would point the wrong way mid-turn.
-                    let ch = match ch {
-                        '╱' | '╲' | '┃' if sin.abs() > 0.05 => '▪',
-                        c => c,
-                    };
-                    r.dot(x as i32, y as i32, z, ch, color);
-                }
-            }
-        }
-    }
-    fn paint(&self, r: &mut Cells, cols: usize, rows: usize, aspect: f32, sound: &Sound) {
-        let (cx, cy, hw, hh) = Self::geometry(cols, rows, aspect);
-        // Digits: a large 6x10 time inside the bottom sand, as brighter grains.
-        let chars: Vec<char> = self.clock.chars().collect();
-        let gw = chars.len() as i32 * 8 - 2;
-        let x0 = cx as i32 - gw / 2;
-        let y0 = (cy + hh) as i32 - 13;
-        let digit_cell = |x: i32, y: i32| {
-            if y < y0 || y >= y0 + 10 || x < x0 {
-                return false;
-            }
-            let i = ((x - x0) / 8) as usize;
-            let rx = (x - x0) % 8;
-            if i >= chars.len() || rx >= 6 {
-                return false;
-            }
-            let d = chars[i].to_digit(10).map(|d| d as usize).unwrap_or(10);
-            DIGITS[d][((y - y0) / 2) as usize].as_bytes()[(rx / 2) as usize] == b'#'
-        };
-        let bottom_y = (cy + hh) as i32;
-        let ceiling = (2. * cy) as i32 - bottom_y;
-        // The digits sink back into plain sand before the glass starts to tip.
-        let digits = if self.flip >= 0. {
-            (1. - self.flip * 5.).max(0.)
-        } else if self.settle >= 0. {
-            0.
-        } else {
-            1.
-        };
-        for col in 0..cols.min(self.bottom.len()) {
-            let (tf, _) = self.floors(col, cx, cy, hw, hh);
-            // Fresh from a turn, each column still hangs at the ceiling and
-            // drops onto the funnel.
-            let drop = if self.settle >= 0. {
-                let gap = (tf - self.top[col] + 1 - ceiling).max(0) as f32;
-                (gap * (1. - self.settle * self.settle)) as i32
-            } else {
-                0
-            };
-            for k in 0..self.top[col] {
-                let y = tf - k - drop;
-                let depth = k as f32 / 12.;
-                r.dot(
-                    col as i32,
-                    y,
-                    1.,
-                    if k == self.top[col] - 1 { '▒' } else { '▓' },
-                    scale(mix((255, 200, 110), (200, 120, 60), depth.min(1.)), 0.85),
-                );
-            }
-            for k in 0..self.bottom[col] {
-                let y = bottom_y - k;
-                let hot = digit_cell(col as i32, y) && digits > 0.;
-                let sand = scale(
-                    mix((200, 120, 60), (255, 190, 100), (k as f32 / 14.).min(1.)),
-                    0.8 + sound.bass * 0.2,
-                );
-                let c = if hot {
-                    mix(
-                        sand,
-                        scale((255, 240, 170), 1. + sound.treble * 0.2),
-                        digits,
-                    )
-                } else {
-                    sand
-                };
-                r.dot(
-                    col as i32,
-                    y,
-                    1.,
-                    if hot {
-                        '█'
-                    } else if k == self.bottom[col] - 1 {
-                        '▒'
-                    } else {
-                        '▓'
-                    },
-                    c,
-                );
-            }
-        }
-        for g in &self.falling {
-            r.dot(
-                g.x.round() as i32,
-                g.y.round() as i32,
-                0.9,
-                if g.vy > 9. { '¦' } else { '·' },
-                (255, 215, 130),
-            );
-        }
-        // Glass and frame drawn last, on top.
-        let glass = scale((160, 200, 230), 0.8 + sound.treble * 0.2);
-        for y in (cy - hh) as i32..=(cy + hh) as i32 {
-            let half = Self::half(y as f32, cy, hw, hh);
-            let (l, rr) = ((cx - half).round() as i32, (cx + half).round() as i32);
-            r.dot(l, y, 0.5, if (y as f32) > cy { '╱' } else { '╲' }, glass);
-            r.dot(rr, y, 0.5, if (y as f32) > cy { '╲' } else { '╱' }, glass);
-        }
-        let wood = (150, 105, 70);
-        for x in (cx - hw) as i32 - 2..=(cx + hw) as i32 + 2 {
-            for dy in [-2, -1] {
-                r.dot(
-                    x,
-                    (cy - hh) as i32 + dy,
-                    0.4,
-                    if dy == -2 { '▀' } else { '█' },
-                    wood,
-                );
-            }
-            for dy in [1, 2] {
-                r.dot(
-                    x,
-                    (cy + hh) as i32 + dy,
-                    0.4,
-                    if dy == 2 { '▄' } else { '█' },
-                    wood,
-                );
-            }
-        }
-        for x in [(cx - hw) as i32 - 3, (cx + hw) as i32 + 3] {
-            for y in (cy - hh) as i32 - 2..=(cy + hh) as i32 + 2 {
-                r.dot(x, y, 0.4, '┃', scale(wood, 0.8));
-            }
-        }
-    }
-}
 // ----------------------------------------------------------------- sand clock
+/// What music moves is measured in cells, so it has to grow with the grid to
+/// look the same on screen at any resolution.
+fn music_reach(rows: usize) -> f32 {
+    (rows as f32 / 80.).max(0.6)
+}
 fn local_hms() -> (u32, u32, u32) {
     // SAFETY: plain libc calls with valid, owned buffers.
     unsafe {
@@ -2330,12 +2256,10 @@ impl SandClock {
     }
     fn draw(&self, r: &mut Raster, sound: &Sound) {
         self.draw_backdrop(r, sound);
-        // With a backdrop the digits tremble on the bass, keeping their shape.
-        let tremble = if self.backdrop == SandBackdrop::None {
-            0.
-        } else {
-            sound.bass * 0.9
-        };
+        // The digits tremble on the bass, keeping their shape.
+        let reach = music_reach(self.rows);
+        let tremble = sound.bass * 0.9 * reach;
+        let halo = reach.round().max(1.) as i32;
         for g in &self.grains {
             let ch = if g.size > 1.15 {
                 '●'
@@ -2344,14 +2268,20 @@ impl SandClock {
             } else {
                 '·'
             };
-            let light = g.shade * (0.95 + sound.treble * 0.2 + sound.bass * 0.1);
-            r.dot(
-                (g.x + (self.time * 41. + g.phase).sin() * tremble).round() as i32,
-                (g.y + (self.time * 37. + g.phase * 2.).sin() * tremble * 0.5).round() as i32,
-                2. - g.size * 0.5,
-                ch,
-                scale((255, 205, 120), light),
-            );
+            // Every grain catches the light on its own beat; treble adds to it.
+            let glint = (self.time * (1.2 + g.speed * 1.6) + g.phase).sin().max(0.).powi(6);
+            let sparkle = glint * (0.7 + sound.treble * 0.9);
+            let light = g.shade * (1.05 + sound.treble * 0.3 + sound.bass * 0.25) + sparkle * 0.6;
+            let x = (g.x + (self.time * 41. + g.phase).sin() * tremble).round() as i32;
+            let y = (g.y + (self.time * 37. + g.phase * 2.).sin() * tremble * 0.5).round() as i32;
+            let colour = mix((255, 205, 120), (255, 250, 232), sparkle + sound.bass * 0.3);
+            r.dot(x, y, 2. - g.size * 0.5, ch, scale(colour, light));
+            if g.size > 0.8 {
+                let glow = scale((255, 150, 55), 0.15 + sound.bass * 0.25 + sparkle * 0.3);
+                for (dx, dy) in [(-2, 0), (2, 0), (0, -1), (0, 1)] {
+                    r.dot(x + dx * halo, y + dy * halo, 3., '░', glow);
+                }
+            }
         }
     }
 }
@@ -2462,6 +2392,7 @@ impl SandClock {
         let time = self.time;
         let friction = (-dt * 3.).exp();
         let (w, h) = (cols as f32, rows as f32);
+        let reach = music_reach(rows);
         match self.backdrop {
             SandBackdrop::None => {}
             SandBackdrop::Chladni => {
@@ -2471,14 +2402,14 @@ impl SandClock {
                     self.figure_clock = 0.;
                     self.figure = (self.figure + 1) % CHLADNI_MODES.len();
                 }
-                let shake = 2.2 + sound.bass * 16.;
+                let shake = (2.2 + sound.bass * 16.) * reach;
                 if self.field_figure != self.figure {
                     self.bake_field(cols, rows, aspect);
                 }
                 for g in &mut self.back {
                     let cell = g.y as usize * cols + g.x as usize;
                     let [f, nx, ny] = self.field[cell.min(self.field.len() - 1)];
-                    let speed = 9. * (f.abs() * 3.).min(1.) * -f.signum();
+                    let speed = 9. * reach * (f.abs() * 3.).min(1.) * -f.signum();
                     let rattle = shake * (0.3 + f.abs()) * dt * 7.;
                     g.x += (nx * speed * aspect + g.vx) * dt
                         + (self.rng.next() - 0.5) * rattle * aspect;
@@ -2491,10 +2422,10 @@ impl SandClock {
                 }
             }
             SandBackdrop::Dunes => {
-                let wind = 9. + sound.bass * 60.;
+                let wind = (9. + sound.bass * 60.) * reach;
                 for g in &mut self.back {
                     let layer = g.a as usize;
-                    g.b += dt * 14.;
+                    g.b += dt * 14. * reach;
                     g.x += (wind * (0.6 + g.shade * 0.6) + g.vx) * dt;
                     g.y += (g.b + g.vy) * dt;
                     g.vx *= friction;
@@ -2503,7 +2434,7 @@ impl SandClock {
                         // Lifted off a crest again, more of it when the bass hits.
                         g.x = self.rng.next() * w;
                         g.y = dune_ridge(layer, g.x, time, rows);
-                        g.b = -(5. + self.rng.next() * 9. + sound.bass * 18.);
+                        g.b = -(5. + self.rng.next() * 9. + sound.bass * 18.) * reach;
                         g.vx = 0.;
                         g.vy = 0.;
                     }
@@ -2514,13 +2445,13 @@ impl SandClock {
                 let (cx, cy) = (w * 0.5, h * 0.5);
                 let settle = (-dt * 0.8).exp();
                 for g in &mut self.back {
-                    g.b += dt * (0.05 + 0.5 / (1. + g.a * 0.09)) * (1. + sound.bass * 1.2);
+                    g.b += dt * (0.05 + 0.5 / (1. + g.a * 0.09 / reach)) * (1. + sound.bass * 1.2);
                     g.x = (g.x + g.vx * dt) * settle;
                     g.y = (g.y + g.vy * dt) * settle;
                     g.vx *= friction;
                     g.vy *= friction;
                     // The bass travels outward through the arms as a ring.
-                    let ring = 1. + sound.bass * 0.24 * (g.a * 0.12 - time * 3.).sin().max(0.);
+                    let ring = 1. + sound.bass * 0.24 * (g.a * 0.12 / reach - time * 3.).sin().max(0.);
                     let r = g.a * ring;
                     g.sx = cx + r * g.b.cos() * aspect + g.x;
                     g.sy = cy + r * g.b.sin() * 0.72 + g.y;
@@ -2597,10 +2528,9 @@ pub(crate) struct Showcase {
     sound: Sound,
     terminal: Option<Terminal>,
     globe: Option<Globe>,
-    city: Option<CityRain>,
+    aquarium: Option<Aquarium>,
     jelly: Option<Jellyfish>,
     cockpit: Option<Cockpit>,
-    hourglass: Option<Hourglass>,
     sand_clock: Option<SandClock>,
     size: std::cell::Cell<Option<(usize, usize, f32)>>,
     raster: std::cell::RefCell<Option<Raster>>,
@@ -2614,10 +2544,9 @@ impl Showcase {
             sound: Sound::default(),
             terminal: (kind == Kind::Terminal).then(Terminal::new),
             globe: (kind == Kind::Globe).then(Globe::new),
-            city: (kind == Kind::CityRain).then(CityRain::new),
+            aquarium: (kind == Kind::Aquarium).then(Aquarium::new),
             jelly: (kind == Kind::Jellyfish).then(Jellyfish::new),
             cockpit: (kind == Kind::Cockpit).then(Cockpit::new),
-            hourglass: (kind == Kind::Hourglass).then(Hourglass::new),
             sand_clock: match kind {
                 Kind::SandClock => Some(SandClock::new(SandBackdrop::None)),
                 Kind::ChladniClock => Some(SandClock::new(SandBackdrop::Chladni)),
@@ -2646,7 +2575,7 @@ impl Showcase {
         let k = 1. - (-dt * 4.).exp();
         self.gaze.0 += (target.0.clamp(-1., 1.) - self.gaze.0) * k;
         self.gaze.1 += (target.1.clamp(-1., 1.) - self.gaze.1) * k;
-        // The hourglass needs the real grid before it pours its sand.
+        // The clocks and the tank build themselves from the real grid.
         let Some((cols, rows, aspect)) = self.size.get() else {
             return;
         };
@@ -2658,17 +2587,14 @@ impl Showcase {
         if let Some(g) = &mut self.globe {
             g.step(dt, &sound);
         }
-        if let Some(c) = &mut self.city {
-            c.step(dt, &sound);
+        if let Some(a) = &mut self.aquarium {
+            a.step(dt, &sound, pointer.map(|_| gaze), cols as f32 / (rows as f32 * aspect).max(1.));
         }
         if let Some(j) = &mut self.jelly {
-            j.step(dt, &sound, gaze);
+            j.step(dt, &sound, pointer.map(|_| gaze));
         }
         if let Some(c) = &mut self.cockpit {
             c.step(dt, &sound, gaze);
-        }
-        if let Some(h) = &mut self.hourglass {
-            h.step(dt, &sound, cols, rows, aspect);
         }
         if let Some(c) = &mut self.sand_clock {
             c.step(dt, &sound, pointer, cols, rows, aspect);
@@ -2704,11 +2630,11 @@ impl Showcase {
                 self.gaze,
                 self.time,
             ),
-            Kind::CityRain => {
-                self.city
+            Kind::Aquarium => {
+                self.aquarium
                     .as_ref()
                     .unwrap()
-                    .draw(r, cols, rows, &self.sound, self.gaze)
+                    .draw(r, cols, rows, aspect, &self.sound)
             }
             Kind::Jellyfish => {
                 self.jelly
@@ -2722,12 +2648,6 @@ impl Showcase {
                     .unwrap()
                     .draw(r, cols, rows, aspect, &self.sound, self.gaze)
             }
-            Kind::Hourglass => {
-                self.hourglass
-                    .as_ref()
-                    .unwrap()
-                    .draw(r, cols, rows, aspect, &self.sound)
-            }
             Kind::SandClock | Kind::ChladniClock | Kind::DunesClock | Kind::GalaxyClock => {
                 self.sand_clock.as_ref().unwrap().draw(r, &self.sound)
             }
@@ -2739,6 +2659,120 @@ impl Showcase {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn fish_stay_in_the_tank_and_the_school_flees_the_cursor() {
+        let mut tank = Aquarium::new();
+        let loud = Sound { bass: 0.8, treble: 0.4 };
+        for frame in 0..6000 {
+            tank.step(1. / 30., &loud, Some((0.6, -0.2)), 1.8);
+            for f in &tank.fish {
+                assert!(f.x > 0. && f.x < 1.8 && f.y > SURFACE && f.y < SAND, "frame {frame}");
+                assert!(f.face.abs() <= 1.0001);
+            }
+            assert!(tank.bubbles.len() <= 140);
+        }
+        assert_eq!(tank.fish.len(), SCHOOL + 8);
+        let cursor = tank.cursor.unwrap();
+        let close = tank.fish.iter().filter(|f| f.breed == Breed::Tetra).filter(|f| {
+            ((f.x - cursor.0).powi(2) + (f.y - cursor.1).powi(2)).sqrt() < 0.05
+        });
+        assert_eq!(close.count(), 0);
+        assert!(!tank.bubbles.is_empty());
+    }
+
+    #[test]
+    fn everything_in_the_tank_answers_the_cursor() {
+        let quiet = Sound { bass: 0., treble: 0. };
+        let frame = |tank: &Aquarium| {
+            let mut r = Raster::new(240, 70);
+            tank.draw(&mut r, 240, 70, 1.75, &quiet);
+            let mut cells = vec![];
+            r.finish(&mut cells);
+            cells
+        };
+        let mut tank = Aquarium::new();
+        tank.step(1. / 30., &quiet, None, 1.8);
+        // The chest opens and the sand rises with no music at all.
+        for _ in 0..60 {
+            tank.step(1. / 30., &quiet, Some((Aquarium::CHEST * 2. - 1., 0.72)), 1.8);
+        }
+        assert!(tank.lid > 0.5, "{}", tank.lid);
+        assert!(!tank.dust.is_empty());
+        let puffer = tank.fish.iter().position(|f| f.breed == Breed::Puffer).unwrap();
+        let spot = (tank.fish[puffer].x / 1.8 * 2. - 1., tank.fish[puffer].y * 2. - 1.);
+        for _ in 0..30 {
+            tank.step(1. / 30., &quiet, Some(spot), 1.8);
+        }
+        assert!(tank.puffed > 0.4, "{}", tank.puffed);
+        // Standing things catch the light.
+        tank.fish.clear();
+        tank.bubbles.clear();
+        tank.dust.clear();
+        tank.time = 0.;
+        tank.cursor = None;
+        let dark = frame(&tank);
+        tank.cursor = Some((1.8 * 0.37, 0.75));
+        let lit = frame(&tank);
+        let moved = dark.iter().filter(|c| !lit.contains(c)).count();
+        assert!(moved > 50, "{moved}");
+    }
+
+    #[test]
+    fn jellyfish_flee_light_up_and_trail_from_the_cursor() {
+        let quiet = Sound { bass: 0., treble: 0. };
+        let mut sea = Jellyfish::new();
+        sea.jellies[0].x = 0.5;
+        sea.jellies[0].y = 0.5;
+        let (mut x, y) = (0.5, 0.5);
+        for _ in 0..40 {
+            sea.step(1. / 30., &quiet, Some((-0.2, 0.)));
+            x = sea.jellies[0].x;
+        }
+        assert!(x > 0.52, "{x} {y}");
+        assert!(sea.jellies[0].fright > 0.3);
+        assert!(sea.jellies[0].trail < 0.);
+        for _ in 0..120 {
+            sea.step(1. / 30., &quiet, None);
+        }
+        assert!(sea.jellies[0].fright < 0.05);
+    }
+
+    #[test]
+    fn corals_sway_with_the_music_and_not_with_the_cursor() {
+        let at = |tank: &Aquarium, bass: f32| {
+            let mut r = Raster::new(240, 70);
+            tank.draw(&mut r, 240, 70, 1.75, &Sound { bass, treble: 0. });
+            let mut cells = vec![];
+            r.finish(&mut cells);
+            cells.into_iter().filter(|c| matches!(c.ch, '*')).map(|c| (c.x, c.y)).collect::<Vec<_>>()
+        };
+        let mut tank = Aquarium::new();
+        tank.time = 3.;
+        let still = at(&tank, 0.);
+        assert!(!still.is_empty());
+        tank.cursor = Some((0.65, 0.7));
+        assert_eq!(still, at(&tank, 0.));
+        assert_ne!(still, at(&tank, 0.9));
+    }
+
+    #[test]
+    fn weed_ignores_the_cursor() {
+        let quiet = Sound { bass: 0., treble: 0. };
+        let mut tank = Aquarium::new();
+        let weed = |tank: &Aquarium| {
+            let mut r = Raster::new(240, 70);
+            tank.frond(&mut r, 100., 60., 40., 4., 0.05, 1., 0, 13., true, 70., 1.75, &quiet);
+            let mut cells = vec![];
+            r.finish(&mut cells);
+            cells
+        };
+        let free = weed(&tank);
+        tank.cursor = Some((0.75, 0.6));
+        assert!(!free.is_empty());
+        assert_eq!(free, weed(&tank));
+    }
+
     #[test]
     fn every_showcase_moves_stays_in_bounds_and_is_unique() {
         for name in Kind::ALL {
@@ -2976,67 +3010,7 @@ mod tests {
         assert!(home(clock, None) > total * 97 / 100, "sand never returned");
     }
     #[test]
-    fn hourglass_sand_settles_into_the_time_and_land_mask_has_continents() {
-        let mut h = Showcase::new(Kind::Hourglass);
-        let mut frame = vec![];
-        h.draw(174, 50, 1.75, &mut frame);
-        for _ in 0..1200 {
-            h.step(0.05, None, Sound::default());
-        }
-        let hg = h.hourglass.as_ref().unwrap();
-        let settled: i32 = hg.bottom.iter().sum();
-        let remaining: i32 = hg.top.iter().sum();
-        assert!(
-            settled > 60,
-            "settled {settled} remaining {remaining} falling {}",
-            hg.falling.len()
-        );
-        let peak = hg.bottom.iter().max().copied().unwrap_or(0);
-        let edge = hg.bottom[hg.cols / 2 - 12];
-        assert!(
-            peak > edge,
-            "cone should peak at the centre: {peak} vs {edge}"
-        );
-        assert_eq!(hg.clock.len(), 5);
-        // Once the sand stops running the glass turns over, and none is lost.
-        let mut h = Showcase::new(Kind::Hourglass);
-        h.draw(174, 50, 1.75, &mut frame);
-        h.step(0.05, None, Sound::default());
-        let hg = h.hourglass.as_ref().unwrap();
-        let total: i32 =
-            hg.top.iter().sum::<i32>() + hg.bottom.iter().sum::<i32>() + hg.falling.len() as i32;
-        let mut flipped = false;
-        let mut sideways = 0;
-        for _ in 0..8000 {
-            h.step(0.05, None, Sound::default());
-            let hg = h.hourglass.as_ref().unwrap();
-            if hg.flip >= 0. {
-                flipped = true;
-                if (hg.flip - 0.5).abs() < 0.03 {
-                    // At the halfway point the glass really lies on its side.
-                    h.draw(174, 50, 1.75, &mut frame);
-                    let (lo, hi) = frame
-                        .iter()
-                        .fold((usize::MAX, 0), |m, c| (m.0.min(c.y), m.1.max(c.y)));
-                    let (xl, xh) = frame
-                        .iter()
-                        .fold((usize::MAX, 0), |m, c| (m.0.min(c.x), m.1.max(c.x)));
-                    sideways = (xh - xl) as i32 - (hi - lo) as i32 * 2;
-                }
-            }
-            let hg = h.hourglass.as_ref().unwrap();
-            if flipped && hg.flip < 0. {
-                let now: i32 = hg.top.iter().sum::<i32>() + hg.bottom.iter().sum::<i32>();
-                assert_eq!(now, total, "sand lost in the turn");
-                assert!(
-                    hg.top.iter().sum::<i32>() > 100,
-                    "sand must be on top again"
-                );
-                assert!(sideways > 0, "glass did not rotate: {sideways}");
-                break;
-            }
-        }
-        assert!(flipped, "hourglass never turned over");
+    fn the_land_mask_has_continents() {
         assert!(land(40.7, -74.0) && land(51.5, -0.1) && land(-23.5, -46.6));
         assert!(!land(0., -150.) && !land(-50., 0.));
     }

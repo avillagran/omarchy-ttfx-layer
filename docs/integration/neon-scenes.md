@@ -32,10 +32,9 @@ These live in `showcase_scenes.rs`, behind `Style::Showcase`.
   and CPU bars are decorative, and memory is the real value, read once a second.
 - `data-globe`: rotating Earth from continent polygons, with bass-born traffic
   arcs between cities.
-- `city-rain`: a city from above, with parks, traffic lights, cars and rain.
+- `aquarium`: a fish tank with a schooling shoal, a castle, and a chest and a puffer that answer the bass
 - `jellyfish`: bells pulsing on bass, plankton leaning toward the cursor.
 - `cockpit`: window frame and HUD, asteroids, ringed planet, warp on bass.
-- `hourglass`: per-column sand stacks with an angle of repose. It turns 180 degrees
   when the sand stops, and the time shows in the lower pile.
 
 ## Sand clocks
