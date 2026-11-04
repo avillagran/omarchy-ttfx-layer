@@ -4,28 +4,38 @@
 //! the cost of an animated background is proportional to its frame rate on
 //! any machine. `TTFX_BG_MAX_FPS=<n>` fixes the ceiling. `TTFX_BG_MAX_FPS=auto`
 //! measures what one frame costs this process in CPU time and picks the
-//! highest ceiling that keeps the process inside a CPU budget (default 8% of
+//! highest ceiling that keeps the process inside a CPU budget (default 25% of
 //! one core, `TTFX_BG_CPU_BUDGET` as a fraction). Where the kernel exposes
 //! how busy the GPU is (Intel RC6 residency, AMD `gpu_busy_percent`), the
 //! ceiling must also keep the whole GPU under `TTFX_BG_GPU_BUDGET` (default
 //! 30%): on old laptops compositing each frame costs more GPU than drawing it
 //! costs CPU. A 2015 MacBook Pro lands around 24 fps; a current machine
-//! releases the ceiling up to 60 fps. The ceiling a scene settled on is
+//! climbs to the refresh rate of its display, and never past it: frames the
+//! display cannot show are wasted. The ceiling a scene settled on is
 //! remembered per scene, so the next start skips the climb: short runs such as
 //! a screensaver look right from the first frame on any machine. A finer grid
 //! the user asked for raises the CPU budget by as much as it raises the work,
 //! up to `MAX_BUDGET`. On battery the ceiling drops to the lowest level, and it
 //! comes back when the charger does.
+//!
+//! With the grid on `auto`, the governor also learns how fine a grid the
+//! machine affords: a scene that holds the display's rate with room for more
+//! cells is remembered one or more density steps finer, and one that cannot
+//! hold it any more one step coarser. The grid is built when the scene starts,
+//! so what was learned shows from the next start; changing it live would make
+//! the picture jump.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Ceilings the governor moves between. Animation speed follows the frame
-/// rate, so the ceiling changes rarely and by one level at a time.
-pub const LEVELS: [f64; 5] = [20.0, 24.0, 30.0, 40.0, 60.0];
+/// Ceilings the governor moves between. It comes down one level at a time
+/// and climbs as far as the measured cost allows.
+pub const LEVELS: [f64; 8] = [20.0, 24.0, 30.0, 40.0, 60.0, 90.0, 120.0, 144.0];
 pub const AUTO_START_FPS: f64 = 24.0;
-const DEFAULT_BUDGET: f64 = 0.08;
+/// The top level when the display's refresh rate is unknown.
+const DEFAULT_TOP: f64 = 60.0;
+const DEFAULT_BUDGET: f64 = 0.25;
 const DEFAULT_GPU_BUDGET: f64 = 0.30;
 const MAX_BUDGET: f64 = 0.80;
 const POWER_SUPPLIES: &str = "/sys/class/power_supply";
@@ -43,6 +53,26 @@ const WARMUP_PERIODS: u32 = 2;
 const MIN_TICKS_PER_PERIOD: u64 = 40;
 /// Weight of the newest period in the running cost estimate.
 const EMA_ALPHA: f64 = 0.25;
+/// What one density step multiplies the cost of a frame by. A step has 1.78
+/// times the cells, but much of a frame does not grow with them: on the M2,
+/// four steps, ten times the cells, cost 2.7 times the CPU per frame. A guess
+/// that is off corrects itself: a grid too fine for the display's rate comes
+/// back down a step on the next start.
+const DENSITY_COST: f64 = 1.3;
+pub const MAX_LEARNED_DENSITY: i32 = 4;
+/// A finer grid must leave this much room at the display's rate, so the
+/// next start does not have to come down again.
+const DENSITY_MARGIN: f64 = 1.15;
+/// Periods in a row the same verdict must hold before it is remembered.
+const DENSITY_PERIODS: u32 = 6;
+
+/// The highest level a display with this refresh rate can show.
+pub fn top_level(refresh: Option<f64>) -> f64 {
+    match refresh.filter(|r| r.is_finite() && *r > 0.0) {
+        Some(hz) => LEVELS.iter().copied().filter(|l| *l <= hz * 1.02).last().unwrap_or(LEVELS[0]),
+        None => DEFAULT_TOP,
+    }
+}
 
 /// Current ceiling in millihertz; 0 means no ceiling.
 static CAP_MILLI: AtomicU32 = AtomicU32::new(0);
@@ -90,11 +120,11 @@ pub fn note_tick() {
 /// costs in process CPU time: one level up when the next level fits the
 /// budget with margin, one level down when the current one exceeds it.
 #[cfg(test)]
-pub fn next_cap(current: f64, cost_us_per_frame: f64, budget: f64) -> f64 {
+pub fn next_cap(current: f64, cost_us_per_frame: f64, budget: f64, top: f64) -> f64 {
     if cost_us_per_frame <= 0.0 {
         return current;
     }
-    pick_level(current, affordable_fps(cost_us_per_frame, budget, None, 1.0))
+    pick_level(current, affordable_fps(cost_us_per_frame, budget, None, 1.0), top)
 }
 
 /// Frame rates each budget allows; infinite when that resource is not measured.
@@ -115,21 +145,58 @@ pub fn affordable_fps(cpu_us_per_frame: f64, cpu_budget: f64, gpu_per_fps: Optio
     }
 }
 
-/// One level up when the next level fits both budgets with margin, one level
-/// down when the current one does not fit either of them.
-pub fn pick_level(current: f64, a: Affordable) -> f64 {
+/// Up to the highest level, no higher than `top`, that fits both budgets
+/// with margin; one level down when the current one does not fit either.
+pub fn pick_level(current: f64, a: Affordable, top: f64) -> f64 {
     let index = LEVELS.iter().position(|l| *l >= current).unwrap_or(LEVELS.len() - 1);
     let level = LEVELS[index];
+    if level > top {
+        return top;
+    }
     if index > 0 && a.cpu.min(a.gpu) < level * DOWN_MARGIN {
         return LEVELS[index - 1];
     }
-    if index + 1 < LEVELS.len() {
-        let next = LEVELS[index + 1];
-        if a.cpu >= next * UP_MARGIN && a.gpu >= next * UP_MARGIN_GPU {
-            return next;
-        }
+    LEVELS[index + 1..]
+        .iter()
+        .copied()
+        .take_while(|next| *next <= top)
+        .filter(|next| a.cpu >= next * UP_MARGIN && a.gpu >= next * UP_MARGIN_GPU)
+        .last()
+        .unwrap_or(level)
+}
+
+/// The density this period argues for: finer by as many steps as the room
+/// left at the display's rate pays for, or one step coarser when the scene
+/// no longer holds that rate.
+pub fn density_verdict(density: i32, cap: f64, top: f64, a: Affordable) -> i32 {
+    if cap < top {
+        return (density - 1).max(0);
     }
-    level
+    let room = a.cpu.min(a.gpu) / top / DENSITY_MARGIN;
+    let steps = if room > 1.0 { (room.ln() / DENSITY_COST.ln()).floor() as i32 } else { 0 };
+    (density + steps).min(MAX_LEARNED_DENSITY).max(density)
+}
+
+/// Where the grid density a scene affords is kept between runs.
+pub fn density_path(scene: &str) -> Option<PathBuf> {
+    let name: String = scene.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    Some(cache_dir()?.join(format!("density-{name}")))
+}
+
+/// The density learned for a scene, 0 when nothing was.
+pub fn recall_density(path: &Path) -> i32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|d| (0..=MAX_LEARNED_DENSITY).contains(d))
+        .unwrap_or(0)
+}
+
+/// What the governor learns about the grid: where to keep it, and the
+/// density the running scene was built with.
+pub struct DensityLearning {
+    pub path: PathBuf,
+    pub density: i32,
 }
 
 /// How busy the GPU is, from the kernel.
@@ -297,12 +364,21 @@ fn remember(path: &Path, fps: f64) {
 /// Apply the mode; in `Auto` this spawns the measuring thread. `log` receives
 /// one line per ceiling change.
 pub fn start(mode: Mode, log: impl Fn(String) + Send + 'static) {
-    start_remembering(mode, None, 1.0, log)
+    start_remembering(mode, None, 1.0, DEFAULT_TOP, None, log)
 }
 
 /// `start`, beginning from the ceiling kept in `memory` and updating it.
-/// `work` is how many times more cells than usual each frame carries.
-pub fn start_remembering(mode: Mode, memory: Option<PathBuf>, work: f64, log: impl Fn(String) + Send + 'static) {
+/// `work` is how many times more cells than usual each frame carries; `top`
+/// is the highest level, from the display's refresh rate. With `density`,
+/// the governor also learns the grid the scene affords.
+pub fn start_remembering(
+    mode: Mode,
+    memory: Option<PathBuf>,
+    work: f64,
+    top: f64,
+    density: Option<DensityLearning>,
+    log: impl Fn(String) + Send + 'static,
+) {
     match mode {
         Mode::Unlimited => CAP_MILLI.store(0, Ordering::Relaxed),
         Mode::Fixed(fps) => {
@@ -314,16 +390,18 @@ pub fn start_remembering(mode: Mode, memory: Option<PathBuf>, work: f64, log: im
         Mode::Auto => {
             let supplies = Path::new(POWER_SUPPLIES);
             let mut battery = on_battery(supplies);
-            let remembered = |memory: &Option<PathBuf>| memory.as_deref().and_then(recall).unwrap_or(AUTO_START_FPS);
+            let remembered =
+                move |memory: &Option<PathBuf>| memory.as_deref().and_then(recall).unwrap_or(AUTO_START_FPS).min(top);
             let first = if battery { LEVELS[0] } else { remembered(&memory) };
             set_cap(first);
             let budget = budget_from_env("TTFX_BG_CPU_BUDGET", (DEFAULT_BUDGET * work.max(1.0)).min(MAX_BUDGET));
             let gpu_budget = budget_from_env("TTFX_BG_GPU_BUDGET", DEFAULT_GPU_BUDGET);
             let meter = GpuMeter::find(Path::new("/sys/class/drm"));
             log(format!(
-                "fps governor: auto, budget {:.1}% of one core{}, starting at {first} fps",
+                "fps governor: auto up to {top} fps, budget {:.1}% of one core{}, starting at {first} fps{}",
                 budget * 100.0,
-                meter.as_ref().map_or(String::new(), |m| format!(" and {:.0}% of the GPU ({})", gpu_budget * 100.0, m.describe()))
+                meter.as_ref().map_or(String::new(), |m| format!(" and {:.0}% of the GPU ({})", gpu_budget * 100.0, m.describe())),
+                density.as_ref().map_or(String::new(), |d| format!(", grid auto{:+}", d.density)),
             ));
             std::thread::Builder::new()
                 .name("ttfx-fps-gov".into())
@@ -335,6 +413,9 @@ pub fn start_remembering(mode: Mode, memory: Option<PathBuf>, work: f64, log: im
                     let mut cpu_ema: Option<f64> = None;
                     let mut gpu_ema: Option<f64> = None;
                     let mut up_streak = 0u32;
+                    // Each period's density verdict, while they all point the same way.
+                    let mut verdicts: Vec<i32> = Vec::new();
+                    let mut learned = false;
                     let ema = |prev: Option<f64>, sample: f64| prev.map_or(sample, |p| p + EMA_ALPHA * (sample - p));
                     loop {
                         for _ in 0..PERIOD.as_secs() {
@@ -373,7 +454,7 @@ pub fn start_remembering(mode: Mode, memory: Option<PathBuf>, work: f64, log: im
                         }
                         let affordable = affordable_fps(cpu_cost, budget, gpu_ema, gpu_budget);
                         let current = cap().unwrap_or(AUTO_START_FPS);
-                        let mut next = pick_level(current, affordable);
+                        let mut next = pick_level(current, affordable, top);
                         if next > current {
                             up_streak += 1;
                             if up_streak < UP_PERIODS {
@@ -395,6 +476,33 @@ pub fn start_remembering(mode: Mode, memory: Option<PathBuf>, work: f64, log: im
                                 affordable.cpu,
                                 affordable.gpu,
                             ));
+                        }
+                        // Once per run: a scene on its way up or down has not settled yet.
+                        if let Some(d) = density.as_ref().filter(|_| !learned) {
+                            let verdict = density_verdict(d.density, next, top, affordable);
+                            if verdict == d.density || verdicts.last().is_some_and(|v| (*v > d.density) != (verdict > d.density)) {
+                                verdicts.clear();
+                            }
+                            if verdict != d.density {
+                                verdicts.push(verdict);
+                            }
+                            if verdicts.len() as u32 >= DENSITY_PERIODS {
+                                // The most cautious of the verdicts.
+                                let target = if verdict > d.density {
+                                    *verdicts.iter().min().unwrap()
+                                } else {
+                                    *verdicts.iter().max().unwrap()
+                                };
+                                learned = true;
+                                if let Some(dir) = d.path.parent() {
+                                    let _ = std::fs::create_dir_all(dir);
+                                }
+                                let _ = std::fs::write(&d.path, format!("{target}\n"));
+                                log(format!(
+                                    "fps governor: grid auto{:+} -> auto{target:+} from the next start (affordable cpu {:.0} gpu {:.0} at {next:.0} fps)",
+                                    d.density, affordable.cpu, affordable.gpu,
+                                ));
+                            }
                         }
                     }
                 })
@@ -455,37 +563,87 @@ mod tests {
     fn an_old_machine_holds_24() {
         // mbp-intel: 1.3 to 2.5 ms of process CPU per frame with the 8% budget.
         for cost in [1700.0, 2100.0, 2500.0, 3300.0] {
-            assert_eq!(next_cap(24.0, cost, 0.08), 24.0, "{cost}");
+            assert_eq!(next_cap(24.0, cost, 0.08, 60.0), 24.0, "{cost}");
         }
     }
 
     #[test]
     fn a_heavy_effect_steps_down_one_level() {
-        assert_eq!(next_cap(24.0, 4000.0, 0.08), 20.0);
-        assert_eq!(next_cap(20.0, 10_000.0, 0.05), 20.0);
+        assert_eq!(next_cap(24.0, 4000.0, 0.08, 60.0), 20.0);
+        assert_eq!(next_cap(20.0, 10_000.0, 0.05, 60.0), 20.0);
     }
 
     #[test]
-    fn a_fast_machine_releases_the_ceiling_one_level_at_a_time() {
-        let mut cap = AUTO_START_FPS;
-        let mut path = vec![cap];
-        while cap < LEVELS[LEVELS.len() - 1] {
-            cap = next_cap(cap, 300.0, 0.05);
-            path.push(cap);
-            assert!(path.len() < 10);
+    fn a_fast_machine_climbs_to_the_display_rate_and_no_further() {
+        // 300 us per frame within 5% affords 166 fps: 90 fits with margin, 120 does not.
+        assert_eq!(next_cap(AUTO_START_FPS, 300.0, 0.05, 60.0), 60.0);
+        assert_eq!(next_cap(AUTO_START_FPS, 300.0, 0.05, 144.0), 90.0);
+        assert_eq!(next_cap(AUTO_START_FPS, 100.0, 0.25, 120.0), 120.0);
+        assert_eq!(next_cap(AUTO_START_FPS, 100.0, 0.25, 144.0), 144.0);
+        // A ceiling above the display comes down to it.
+        assert_eq!(next_cap(120.0, 100.0, 0.25, 60.0), 60.0);
+    }
+
+    #[test]
+    fn the_top_level_follows_the_refresh_rate() {
+        assert_eq!(top_level(None), 60.0);
+        assert_eq!(top_level(Some(59.972)), 60.0);
+        assert_eq!(top_level(Some(60.0)), 60.0);
+        assert_eq!(top_level(Some(75.0)), 60.0);
+        assert_eq!(top_level(Some(120.0)), 120.0);
+        assert_eq!(top_level(Some(143.9)), 144.0);
+        assert_eq!(top_level(Some(240.0)), 144.0);
+        assert_eq!(top_level(Some(0.0)), 60.0);
+    }
+
+    #[test]
+    fn the_balanced_budget_still_holds_an_old_laptop_near_24() {
+        // mbp-intel: ~2 ms CPU per frame, ~0.96% GPU busy per fps. The GPU decides.
+        let a = affordable_fps(2000.0, DEFAULT_BUDGET, Some(0.0096), DEFAULT_GPU_BUDGET);
+        assert_eq!(pick_level(AUTO_START_FPS, a, 60.0), 24.0);
+        assert_eq!(density_verdict(0, 24.0, 60.0, a), 0);
+    }
+
+    #[test]
+    fn room_at_the_display_rate_buys_finer_grids() {
+        let cpu = |fps: f64| Affordable { cpu: fps, gpu: f64::INFINITY };
+        // At 60 fps a step needs 60 x 1.15 x 1.3 = 90 affordable, two need 117.
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(85.0)), 0);
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(91.0)), 1);
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(120.0)), 2);
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(100_000.0)), MAX_LEARNED_DENSITY);
+        assert_eq!(density_verdict(2, 60.0, 60.0, cpu(91.0)), 3, "counts from the grid it runs");
+        // The M2 at 120 Hz: 1.24 ms a frame within a quarter of a core affords 202 fps.
+        assert_eq!(density_verdict(0, 120.0, 120.0, cpu(202.0)), 1);
+        // Below the display's rate the grid gives way first, down to auto.
+        assert_eq!(density_verdict(2, 40.0, 60.0, cpu(50.0)), 1);
+        assert_eq!(density_verdict(0, 40.0, 60.0, cpu(50.0)), 0);
+        // A GPU without room holds the grid.
+        assert_eq!(density_verdict(0, 60.0, 60.0, Affordable { cpu: 1000.0, gpu: 70.0 }), 0);
+    }
+
+    #[test]
+    fn a_learned_density_survives_between_runs_only_in_range() {
+        let dir = std::env::temp_dir().join(format!("ttfx-density-memory-{}", std::process::id()));
+        let path = dir.join("density-neon-city");
+        assert_eq!(recall_density(&path), 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (text, want) in [("2\n", 2), ("4", 4), ("5", 0), ("-1", 0), ("x", 0)] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(recall_density(&path), want, "{text:?}");
         }
-        assert_eq!(path, vec![24.0, 30.0, 40.0, 60.0]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn stepping_up_needs_margin_and_stepping_down_needs_excess() {
         // 1.0 ms affords 50 fps: not 1.6 x 60, so 40 holds; 30 needs 64 to step up.
-        assert_eq!(next_cap(40.0, 1000.0, 0.05), 40.0);
-        assert_eq!(next_cap(30.0, 1000.0, 0.05), 30.0);
-        assert_eq!(next_cap(30.0, 700.0, 0.05), 40.0);
+        assert_eq!(next_cap(40.0, 1000.0, 0.05, 60.0), 40.0);
+        assert_eq!(next_cap(30.0, 1000.0, 0.05, 60.0), 30.0);
+        assert_eq!(next_cap(30.0, 700.0, 0.05, 60.0), 40.0);
         // 1.3 ms affords 38 fps: below 0.9 x 40 only once under 36.
-        assert_eq!(next_cap(40.0, 1300.0, 0.05), 40.0);
-        assert_eq!(next_cap(40.0, 1400.0, 0.05), 30.0);
+        assert_eq!(next_cap(40.0, 1300.0, 0.05, 60.0), 40.0);
+        assert_eq!(next_cap(40.0, 1400.0, 0.05, 60.0), 30.0);
     }
 
     #[test]
@@ -493,18 +651,18 @@ mod tests {
         // mbp-intel: ~2 ms CPU per frame, ~0.96% GPU busy per fps.
         let a = affordable_fps(2000.0, 0.08, Some(0.0096), 0.30);
         assert!((a.gpu - 31.25).abs() < 0.1, "{a:?}");
-        assert_eq!(pick_level(20.0, a), 24.0, "recovers from a slow start");
-        assert_eq!(pick_level(24.0, a), 24.0, "does not climb to 30");
-        assert_eq!(pick_level(30.0, a), 30.0, "30 fps is still inside the budget");
-        assert_eq!(pick_level(30.0, affordable_fps(2000.0, 0.08, Some(0.012), 0.30)), 24.0, "over it, comes down");
+        assert_eq!(pick_level(20.0, a, 60.0), 24.0, "recovers from a slow start");
+        assert_eq!(pick_level(24.0, a, 60.0), 24.0, "does not climb to 30");
+        assert_eq!(pick_level(30.0, a, 60.0), 30.0, "30 fps is still inside the budget");
+        assert_eq!(pick_level(30.0, affordable_fps(2000.0, 0.08, Some(0.012), 0.30), 60.0), 24.0, "over it, comes down");
         // A start-up period that looks expensive drops one level only.
-        assert_eq!(pick_level(24.0, affordable_fps(2400.0, 0.08, Some(0.015), 0.30)), 20.0);
+        assert_eq!(pick_level(24.0, affordable_fps(2400.0, 0.08, Some(0.015), 0.30), 60.0), 20.0);
     }
 
     #[test]
     fn without_a_gpu_meter_only_the_cpu_counts() {
-        assert_eq!(pick_level(30.0, affordable_fps(1600.0, 0.08, None, 0.30)), 30.0);
-        assert_eq!(pick_level(30.0, affordable_fps(1000.0, 0.08, None, 0.30)), 40.0);
+        assert_eq!(pick_level(30.0, affordable_fps(1600.0, 0.08, None, 0.30), 60.0), 30.0);
+        assert_eq!(pick_level(30.0, affordable_fps(1000.0, 0.08, None, 0.30), 60.0), 40.0);
     }
 
     #[test]
@@ -524,6 +682,6 @@ mod tests {
 
     #[test]
     fn no_frames_means_no_change() {
-        assert_eq!(next_cap(30.0, 0.0, 0.05), 30.0);
+        assert_eq!(next_cap(30.0, 0.0, 0.05, 60.0), 30.0);
     }
 }

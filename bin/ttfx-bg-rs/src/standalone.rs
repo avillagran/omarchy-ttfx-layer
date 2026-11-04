@@ -193,6 +193,13 @@ fn hyprland_output_size(output: Option<&str>) -> Result<(i32, i32, f64)> {
     ))
 }
 
+/// Refresh rate of an output, from Hyprland.
+fn hyprland_refresh_rate(output: Option<&str>) -> Option<f64> {
+    let out = std::process::Command::new("hyprctl").args(["monitors", "-j"]).output().ok()?;
+    let monitors: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    monitors.as_array()?.iter().find(|m| output.is_none_or(|o| m["name"] == o))?["refreshRate"].as_f64()
+}
+
 /// Grid for an output: the same cell size the plugin's GPU path picks.
 const AUTO_RESOLUTION: i64 = 0;
 
@@ -287,7 +294,15 @@ pub fn run(args: &[String]) -> Result<()> {
     });
     // Cells grow with the square of the density the user chose.
     let work = DENSITY_STEP.powi(-2 * opts.density.max(0));
-    fps_governor::start_remembering(mode, fps_governor::memory_path(&scene), work, |line| log_dbg(&line));
+    // A plain `auto` grid with an automatic ceiling takes the density this
+    // scene was found to afford here; a density the user chose wins.
+    let learning = (value(args, "--resolution") == Some("auto") && mode == fps_governor::Mode::Auto)
+        .then(|| fps_governor::density_path(&scene))
+        .flatten()
+        .map(|path| fps_governor::DensityLearning { density: fps_governor::recall_density(&path), path });
+    let density = learning.as_ref().map_or(opts.density, |l| l.density);
+    let top = fps_governor::top_level(hyprland_refresh_rate(opts.output.as_deref()));
+    fps_governor::start_remembering(mode, fps_governor::memory_path(&scene), work, top, learning, |line| log_dbg(&line));
 
     let (width, height, scale) = match opts.size {
         Some(size) => size,
@@ -298,7 +313,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         opts.resolution
     };
-    let (cols, rows, cell_px, cell_aspect) = grid_for(width, height, scale, resolution, opts.density);
+    let (cols, rows, cell_px, cell_aspect) = grid_for(width, height, scale, resolution, density);
     let cfg = Config {
         effects: opts.effects.clone(),
         audio: opts.audio,
