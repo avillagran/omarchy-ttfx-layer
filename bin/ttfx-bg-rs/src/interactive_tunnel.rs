@@ -472,9 +472,26 @@ impl Tunnel {
 /// as fractions of it; empty when `lo > hi`. A segment already inside, as most
 /// are, needs none of the four divisions: the general case gives 0 and 1 too.
 fn clip_span(a: (f32, f32), d: (f32, f32), right: f32, bottom: f32) -> (f32, f32) {
+    let side = |x: f32, y: f32| {
+        u8::from(x < 0.) | (u8::from(x > right) << 1)
+            | (u8::from(y < 0.) << 2) | (u8::from(y > bottom) << 3)
+    };
+    let end = (a.0 + d.0, a.1 + d.1);
     let inside = |x: f32, y: f32| x >= 0. && y >= 0. && x <= right && y <= bottom;
-    if inside(a.0, a.1) && inside(a.0 + d.0, a.1 + d.1) {
+    // Preserve the original hot path before testing outside half-planes.
+    if inside(a.0, a.1) && inside(end.0, end.1) {
         return (0., 1.);
+    }
+    // The caller rejects non-finite endpoints, but subtracting finite extreme
+    // endpoints may overflow. Keep the previous arithmetic for that case too.
+    if ![a.0, a.1, end.0, end.1].iter().all(|v| v.is_finite()) {
+        return clip_span_general(a, d, right, bottom);
+    }
+    let first = side(a.0, a.1);
+    let last = side(end.0, end.1);
+    // A convex viewport cannot meet a segment wholly beyond one of its sides.
+    if first & last != 0 {
+        return (1., 0.);
     }
     clip_span_general(a, d, right, bottom)
 }
@@ -508,6 +525,13 @@ struct Mark {
     ch: char,
     color: (u8, u8, u8),
 }
+/// One cell of the scene fingerprint, shared with the complete-frame oracle.
+pub(crate) fn frame_print_cell(print: u64, c: &DirectCell) -> u64 {
+    let (r, g, b) = c.color;
+    let cell = (c.x as u64) << 44 ^ (c.y as u64) << 32 ^ (c.ch as u64) << 8
+        ^ (r as u64) << 16 ^ (g as u64) << 24 ^ b as u64;
+    (print ^ cell).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+}
 pub(crate) struct Raster {
     cols: usize,
     rows: usize,
@@ -534,15 +558,23 @@ impl Raster {
     }
     /// Hand over the frame and leave the buffers ready for the next one.
     pub(crate) fn recycle(&mut self, out: &mut Vec<DirectCell>) {
-        self.drain(out, false);
+        self.drain::<false>(out, false);
     }
     /// As `recycle`, less blank black cells: those only hid what was behind
     /// them and are the same pixels as no cell at all.
     pub(crate) fn recycle_visible(&mut self, out: &mut Vec<DirectCell>) {
-        self.drain(out, true);
+        self.drain::<false>(out, true);
     }
-    fn drain(&mut self, out: &mut Vec<DirectCell>, skip_blank: bool) {
+    /// Hand over cells and fingerprint them while they are already in hand.
+    /// The ordinary preview draw does not pay for this producer-only pass.
+    pub(crate) fn recycle_with_print(&mut self, out: &mut Vec<DirectCell>) -> u64 {
+        self.drain::<true>(out, false)
+    }
+    fn drain<const PRINT: bool>(&mut self, out: &mut Vec<DirectCell>, skip_blank: bool) -> u64 {
         out.clear();
+        let mut print = if PRINT {
+            self.drawn.iter().map(|bits| bits.count_ones() as u64).sum::<u64>() + 1
+        } else { 0 };
         for (word, bits) in self.drawn.iter_mut().enumerate() {
             let mut left = std::mem::take(bits);
             while left != 0 {
@@ -553,16 +585,19 @@ impl Raster {
                 if skip_blank && ch == ' ' && color == (0, 0, 0) {
                     continue;
                 }
-                out.push(DirectCell {
+                let cell = DirectCell {
                     x: i % self.cols,
                     y: i / self.cols,
                     ch,
                     color,
                     background: None,
                     attrs: 1,
-                });
+                };
+                if PRINT { print = frame_print_cell(print, &cell); }
+                out.push(cell);
             }
         }
+        print
     }
     #[cfg(test)]
     pub(crate) fn finish(mut self, out: &mut Vec<DirectCell>) {
@@ -811,19 +846,44 @@ mod tests {
     }
 
     #[test]
-    fn the_inside_shortcut_clips_like_the_general_case() {
+    fn trivial_accept_and_reject_clip_like_the_general_case() {
         let mut seed = 99u32;
         let mut next = move || {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             (seed >> 8) as f32 / 16777216.
         };
-        for _ in 0..2_000_000 {
-            let a = (next() * 320. - 10., next() * 110. - 10.);
-            let b = (next() * 320. - 10., next() * 110. - 10.);
+        for i in 0..2_000_000 {
+            let extent = [1., 10., 100., 1000.][i & 3];
+            let a = ((next() * 320. - 10.) * extent, (next() * 110. - 10.) * extent);
+            let b = ((next() * 320. - 10.) * extent, (next() * 110. - 10.) * extent);
             let d = (b.0 - a.0, b.1 - a.1);
             let general = clip_span_general(a, d, 299., 89.);
             let fast = clip_span(a, d, 299., 89.);
             assert!(fast == general || (fast.0 > fast.1 && general.0 > general.1), "{a:?} {b:?} {fast:?} {general:?}");
+        }
+    }
+
+    #[test]
+    fn nonfinite_or_overflowing_segments_keep_the_general_arithmetic() {
+        let values = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX, 0., 1.];
+        for x in values {
+            for y in values {
+                for (a, b) in [((x, y), (1., 2.)), ((1., 2.), (x, y)), ((x, -y), (-x, y))] {
+                    let d = (b.0 - a.0, b.1 - a.1);
+                    let fast = clip_span(a, d, 299., 89.);
+                    let general = clip_span_general(a, d, 299., 89.);
+                    assert!(fast == general || (fast.0 > fast.1 && general.0 > general.1), "{a:?} {b:?}: {fast:?} {general:?}");
+                }
+            }
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut r = Raster::new(8, 8);
+            for (a, b) in [((bad, 0.), (1., 1.)), ((1., 1.), (0., bad))] {
+                r.line_with_glyph(a, b, 1., (1, 2, 3), false, None);
+            }
+            let mut out = vec![];
+            r.recycle(&mut out);
+            assert!(out.is_empty());
         }
     }
 

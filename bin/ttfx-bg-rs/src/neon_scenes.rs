@@ -51,8 +51,12 @@ pub(crate) struct Scene {
     serial: u32,
     showcase: Option<crate::showcase_scenes::Showcase>,
     raster: std::cell::RefCell<Option<Raster>>,
+    /// World heights do not move until the next three-unit terrain strip.
+    terrain: std::cell::RefCell<Option<(i32, [[f32; 21]; 30])>>,
     /// The last depth lit and its light; a new frame starts it over.
     glow_at: std::cell::Cell<(f32, f32, f32)>,
+    #[cfg(test)]
+    exhaustive: bool,
 }
 impl Scene {
     pub(crate) fn new(style: Style) -> Self {
@@ -66,7 +70,10 @@ impl Scene {
             spawn: 0.,
             serial: rand::random(),
             raster: Default::default(),
+            terrain: Default::default(),
             glow_at: std::cell::Cell::new((f32::NAN, 0., 0.)),
+            #[cfg(test)]
+            exhaustive: false,
             showcase: match style {
                 Style::Showcase(kind) => Some(crate::showcase_scenes::Showcase::new(kind)),
                 _ => None,
@@ -125,13 +132,19 @@ impl Scene {
         self.gaze.1 += (target.1.clamp(-1., 1.) - self.gaze.1) * k;
     }
     pub(crate) fn draw(&self, cols: usize, rows: usize, aspect: f32, out: &mut Vec<DirectCell>) {
+        self.draw_into::<false>(cols, rows, aspect, out);
+    }
+    fn draw_with_print(&self, cols: usize, rows: usize, aspect: f32, out: &mut Vec<DirectCell>) -> u64 {
+        self.draw_into::<true>(cols, rows, aspect, out)
+    }
+    fn draw_into<const PRINT: bool>(&self, cols: usize, rows: usize, aspect: f32, out: &mut Vec<DirectCell>) -> u64 {
         out.clear();
         if let Some(show) = &self.showcase {
             show.draw(cols, rows, aspect, out);
-            return;
+            return if PRINT { frame_print(out) } else { 0 };
         }
         if cols == 0 || rows == 0 {
-            return;
+            return if PRINT { 1 } else { 0 };
         }
         let mut slot = self.raster.borrow_mut();
         let r = match slot.take() {
@@ -155,8 +168,9 @@ impl Scene {
             Style::Showcase(_) => unreachable!("delegated above"),
         }
         self.draw_accents(&mut c);
-        c.r.recycle(out);
+        let print = if PRINT { c.r.recycle_with_print(out) } else { c.r.recycle(out); 0 };
         *slot = Some(c.r);
+        print
     }
     fn draw_accents(&self, c: &mut Canvas) {
         for a in &self.accents {
@@ -643,6 +657,17 @@ impl Scene {
         // A continuous terrain under the camera: no lanes, median or road gap.
         let phase = self.travel % 3.;
         let index = (self.travel / 3.).floor() as i32;
+        // Adjacent strips and bands share their world vertices. These heights
+        // remain the same until travel reaches the next three-unit strip.
+        #[cfg(test)]
+        let cached = !self.exhaustive;
+        #[cfg(not(test))]
+        let cached = true;
+        let mut terrain = self.terrain.borrow_mut();
+        if cached && terrain.as_ref().is_none_or(|(at, _)| *at != index) {
+            *terrain = Some((index, lunar_heights(index)));
+        }
+        let heights = cached.then(|| &terrain.as_ref().unwrap().1);
         for n in (-1..28).rev() {
             let raw_z = 1. + n as f32 * 3. - phase;
             let Some((z, far, t)) = lunar_visible_strip(raw_z) else {
@@ -651,10 +676,13 @@ impl Scene {
             for band in -10..10 {
                 let point = |b: i32, k: i32, zz: f32| {
                     let x = b as f32 * 2.;
-                    let world = k as f32 * 3.;
-                    let y = lunar_ground(x, world);
+                    let ground = |k: i32| match heights {
+                        Some(rows) => rows[(k - index + 1) as usize][(b + 10) as usize],
+                        None => lunar_ground(x, k as f32 * 3.),
+                    };
+                    let y = ground(k);
                     let y = if zz == z {
-                        y + (lunar_ground(x, world + 3.) - y) * t
+                        y + (ground(k + 1) - y) * t
                     } else {
                         y
                     };
@@ -979,6 +1007,12 @@ fn lunar_visible_strip(raw_z: f32) -> Option<(f32, f32, f32)> {
     let near = raw_z.max(0.8);
     Some((near, far, (near - raw_z) / 3.))
 }
+fn lunar_heights(index: i32) -> [[f32; 21]; 30] {
+    std::array::from_fn(|row| {
+        let world = (index + row as i32 - 1) as f32 * 3.;
+        std::array::from_fn(|col| lunar_ground((col as i32 - 10) as f32 * 2., world))
+    })
+}
 fn lunar_ground(x: f32, world_z: f32) -> f32 {
     // Original rolling neon ridges, extended continuously across the old road.
     let band = x.abs() * 0.5;
@@ -1229,11 +1263,7 @@ impl Canvas {
 /// Tells a frame from the one before it. Telling them apart wrongly would hold
 /// back one frame out of 2^64, and the next one corrects it.
 fn frame_print(cells: &[DirectCell]) -> u64 {
-    cells.iter().fold(cells.len() as u64 + 1, |print, c| {
-        let (r, g, b) = c.color;
-        let cell = (c.x as u64) << 44 ^ (c.y as u64) << 32 ^ (c.ch as u64) << 8 ^ (r as u64) << 16 ^ (g as u64) << 24 ^ b as u64;
-        (print ^ cell).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
-    })
+    cells.iter().fold(cells.len() as u64 + 1, crate::interactive_tunnel::frame_print_cell)
 }
 pub fn run(
     style: Style,
@@ -1264,10 +1294,9 @@ pub fn run(
             seen = true;
         }
         scene.step(dt, pointer.sample(), sound);
-        scene.draw(cols, rows, aspect, &mut cells);
         // A still frame costs the GPU and the battery nothing if never sent.
-        // The print saves keeping a copy of every frame just to compare it.
-        let print = frame_print(&cells);
+        // Fingerprint during hand-over, without reading the cell list again.
+        let print = scene.draw_with_print(cols, rows, aspect, &mut cells);
         if print != shown {
             shown = print;
             let mut slot = snapshot.lock().unwrap();
@@ -1450,6 +1479,118 @@ mod tests {
             }
             let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
             eprintln!("COST {style:?} step {:.3} ms draw {:.3} ms cells {}", ms(step), ms(draw), out.len());
+        }
+    }
+    #[test]
+    fn fused_handover_keeps_every_cell_and_fingerprint_exact() {
+        for (cols, rows) in [(304, 72), (936, 279), (61, 23), (0, 23)] {
+            for style in [Style::City, Style::Circuit, Style::Vector, Style::Sunset] {
+                let mut scene = Scene::new(style);
+                scene.serial = 0x5eed;
+                let (mut cells, mut fused) = (vec![], vec![]);
+                for frame in 0..120 {
+                    let f = frame as f32;
+                    let level = if frame % 60 < 30 { 0. } else { 0.8 };
+                    scene.step(0.05, Some((0.5 + (f * 0.03).sin() * 0.45, 0.4)), Sound { bass: level, treble: level * 0.8 });
+                    scene.draw(cols, rows, 2.17, &mut cells);
+                    let print = scene.draw_with_print(cols, rows, 2.17, &mut fused);
+                    assert_eq!(cells, fused, "{style:?} {cols}x{rows} frame{frame}");
+                    assert_eq!(frame_print(&cells), print, "{style:?} {cols}x{rows} frame{frame}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn showcase_handover_retains_the_complete_frame_fingerprint() {
+        for name in crate::showcase_scenes::Kind::ALL {
+            let mut scene = Scene::new(Style::parse(name).unwrap());
+            let (mut ordinary, mut fused) = (vec![], vec![]);
+            for frame in 0..30 {
+                scene.step(0.05, Some((0.4, 0.5)), Sound { bass: (frame % 2) as f32 * 0.8, treble: 0.4 });
+                scene.draw(61, 23, 2.17, &mut ordinary);
+                let print = scene.draw_with_print(61, 23, 2.17, &mut fused);
+                assert_eq!(ordinary, fused, "{name} frame{frame}");
+                assert_eq!(frame_print(&ordinary), print, "{name} frame{frame}");
+            }
+        }
+    }
+    #[test]
+    #[ignore = "deterministic fused print cost, not physical efficiency evidence"]
+    fn ascii_fused_print_cost() {
+        for (cols, rows) in [(304, 72), (936, 279)] {
+            for style in [Style::City, Style::Circuit] {
+                for fused in [false, true, true, false] {
+                    let mut scene = Scene::new(style);
+                    scene.serial = 0x5eed;
+                    let mut out = vec![];
+                    let mut cost = Duration::ZERO;
+                    for frame in 0..210 {
+                        scene.step(0.05, Some((0.4, 0.5)), Sound::default());
+                        let begin = Instant::now();
+                        let print = if fused { scene.draw_with_print(cols, rows, 2.17, &mut out) }
+                            else { scene.draw(cols, rows, 2.17, &mut out); frame_print(&out) };
+                        let end = Instant::now();
+                        std::hint::black_box(print);
+                        if frame >= 60 { cost += end - begin; }
+                    }
+                    eprintln!("ASCII_FUSED {style:?} {cols}x{rows} fused={fused} total={:.4}ms", cost.as_secs_f64() * 1000. / 150.);
+                }
+            }
+        }
+    }
+    #[test]
+    fn shared_terrain_heights_leave_every_scene_cell_exact() {
+        for (cols, rows) in [(304, 72), (936, 279), (61, 23)] {
+            let mut fast = Scene::new(Style::Circuit);
+            let mut slow = Scene::new(Style::Circuit);
+            fast.serial = 0x5eed;
+            slow.serial = fast.serial;
+            slow.exhaustive = true;
+            let (mut a, mut b) = (vec![], vec![]);
+            for frame in 0..360 {
+                let f = frame as f32;
+                let pointer = Some((0.5 + (f * 0.071).sin() * 0.45, 0.5 + (f * 0.033).cos() * 0.45));
+                let level = if frame % 120 < 60 { 0. } else { 0.7 };
+                let sound = Sound { bass: level, treble: level * 0.8 };
+                let dt = [0.05, 0.033, 0.1, 0.0083][frame % 4];
+                fast.step(dt, pointer, sound);
+                slow.step(dt, pointer, sound);
+                if frame % 30 == 0 {
+                    let travel = [0., 0.001, 2.9999, 3., 6143.9995, 6144.][frame / 30 % 6];
+                    fast.travel = travel;
+                    slow.travel = travel;
+                }
+                fast.draw(cols, rows, 2.17, &mut a);
+                slow.draw(cols, rows, 2.17, &mut b);
+                assert_eq!(a, b, "{cols}x{rows} frame {frame}");
+            }
+        }
+    }
+    #[test]
+    #[ignore = "deterministic scene-only shortcut costs; not a hardware efficiency claim"]
+    fn ascii_producer_shortcuts_frame_cost() {
+        for (cols, rows) in [(304, 72), (936, 279)] {
+            for style in [Style::City, Style::Circuit] {
+                for exhaustive in [true, false] {
+                    let mut scene = Scene::new(style);
+                    scene.serial = 0x5eed;
+                    scene.exhaustive = exhaustive;
+                    let mut out = vec![];
+                    let (mut draw, mut print) = (Duration::ZERO, Duration::ZERO);
+                    let frames = 150;
+                    for frame in 0..frames + 60 {
+                        scene.step(0.05, Some((0.4, 0.5)), Sound::default());
+                        let begin = Instant::now();
+                        scene.draw(cols, rows, 2.17, &mut out);
+                        let drawn = Instant::now();
+                        std::hint::black_box(frame_print(&out));
+                        let printed = Instant::now();
+                        if frame >= 60 { draw += drawn - begin; print += printed - drawn; }
+                    }
+                    let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
+                    eprintln!("ASCII_SHORTCUT {style:?} {cols}x{rows} exhaustive={exhaustive} draw={:.4}ms print={:.4}ms", ms(draw), ms(print));
+                }
+            }
         }
     }
     #[test]

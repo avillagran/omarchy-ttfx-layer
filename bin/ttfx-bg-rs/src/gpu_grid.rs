@@ -66,6 +66,12 @@ pub struct GpuGrid {
     /// so the diff visits only these instead of the whole grid.
     written: Vec<(u32, u32)>,
     prev_written: Vec<(u32, u32)>,
+    /// Dense frames are cheaper to compare as streaming rows than to list
+    /// and revisit their cells twice. Their damage and uploads stay exact.
+    dense: bool,
+    prev_dense: bool,
+    #[cfg(test)]
+    listed_only: bool,
     /// The last damage made `prev` equal to the current planes, but the
     /// swap that makes it so waits for the next fill instead of a copy.
     prev_pending: bool,
@@ -177,6 +183,10 @@ impl GpuGrid {
             prev_bg: Vec::new(),
             written: Vec::new(),
             prev_written: Vec::new(),
+            dense: false,
+            prev_dense: false,
+            #[cfg(test)]
+            listed_only: false,
             prev_pending: false,
             force_full: true,
             upload_rows: None,
@@ -232,6 +242,7 @@ impl GpuGrid {
             self.prev_fg.clone_from(&self.fg);
             self.prev_bg.clone_from(&self.bg);
             self.prev_written.clone_from(&self.written);
+            self.prev_dense = self.dense;
             self.prev_pending = false;
             self.upload_rows = None;
             return None;
@@ -240,20 +251,41 @@ impl GpuGrid {
             // No fill since the last damage: nothing changed.
             return Some(tiles);
         }
-        // A cell zero in both frames is equal in both, so only cells either
-        // frame wrote can differ.
         let mut changed = [NO_ROWS; 2];
-        for &(cell, tile) in self.written.iter().chain(&self.prev_written) {
-            let (i, tile) = (cell as usize * 4, tile as usize);
-            let fg = word(&self.fg, i) != word(&self.prev_fg, i);
-            let bg = word(&self.bg, i) != word(&self.prev_bg, i);
-            if fg || bg {
-                tiles[tile] = true;
-                let row = cell as usize / cols;
-                for (rows, differs) in changed.iter_mut().zip([fg, bg]) {
-                    if differs {
-                        *rows = join_rows(*rows, (row, row + 1));
+        if self.dense || self.prev_dense {
+            // Dense rows compare in contiguous loads. Rows not changed are
+            // settled once; changed rows still damage only their changed tiles.
+            let row_bytes = cols * 4;
+            for y in 0..rows {
+                let span = y * row_bytes..(y + 1) * row_bytes;
+                let fg = self.fg[span.clone()] != self.prev_fg[span.clone()];
+                let bg = self.bg[span.clone()] != self.prev_bg[span.clone()];
+                if !(fg || bg) { continue; }
+                if fg { changed[0] = join_rows(changed[0], (y, y + 1)); }
+                if bg { changed[1] = join_rows(changed[1], (y, y + 1)); }
+                for x in 0..tx {
+                    let tile = (y / TILE_H) * tx + x;
+                    if tiles[tile] { continue; }
+                    let a = span.start + x * TILE_W * 4;
+                    let b = span.start + ((x + 1) * TILE_W).min(cols) * 4;
+                    if (fg && self.fg[a..b] != self.prev_fg[a..b])
+                        || (bg && self.bg[a..b] != self.prev_bg[a..b]) {
+                        tiles[tile] = true;
                     }
+                }
+            }
+        } else {
+            // A cell zero in both frames is equal in both, so only cells
+            // either sparse frame wrote can differ.
+            for &(cell, tile) in self.written.iter().chain(&self.prev_written) {
+                let (i, tile) = (cell as usize * 4, tile as usize);
+                let fg = word(&self.fg, i) != word(&self.prev_fg, i);
+                let bg = word(&self.bg, i) != word(&self.prev_bg, i);
+                if fg || bg {
+                    tiles[tile] = true;
+                    let row = cell as usize / cols;
+                    if fg { changed[0] = join_rows(changed[0], (row, row + 1)); }
+                    if bg { changed[1] = join_rows(changed[1], (row, row + 1)); }
                 }
             }
         }
@@ -362,6 +394,7 @@ impl GpuGrid {
             std::mem::swap(&mut self.fg, &mut self.prev_fg);
             std::mem::swap(&mut self.bg, &mut self.prev_bg);
             std::mem::swap(&mut self.written, &mut self.prev_written);
+            std::mem::swap(&mut self.dense, &mut self.prev_dense);
             self.prev_pending = false;
         }
         if self.fill_once(cells)? {
@@ -377,19 +410,38 @@ impl GpuGrid {
     }
 
     fn fill_once(&mut self, cells: &[DirectCell]) -> Result<bool> {
+        self.dense = cells.len() >= (self.cols * self.rows).div_ceil(4);
+        #[cfg(test)]
+        if self.listed_only { self.dense = false; }
+        // Choose once per frame: sparse TTFx never checks dense/memo flags
+        // per cell, and dense runs need not keep a redundant written list.
+        if self.dense { self.fill_cells::<true>(cells) }
+        else { self.fill_cells::<false>(cells) }
+    }
+
+    fn fill_cells<const DENSE: bool>(&mut self, cells: &[DirectCell]) -> Result<bool> {
         self.unsynced = true;
         // A full clear streams faster than visiting the written cells.
         self.fg.fill(0);
         self.bg.fill(0);
         self.written.clear();
         let tiles_wide = self.cols.div_ceil(TILE_W);
+        // Adjacent cells often carry the same glyph and style (a wall, road
+        // edge or beam), even when their colors differ. Avoid hashing those
+        // runs. This memo lives only for this atlas fill/retry.
+        let mut last_glyph = None::<(char, u64, u16)>;
+        // Sparse frames pay no run-key work: their glyphs are often varied
+        // grains or letters, for which the general slot cache already wins.
+
         for cell in cells {
             if cell.x >= self.cols || cell.y >= self.rows {
                 continue;
             }
             let index = cell.y * self.cols + cell.x;
             let tile = (cell.y / TILE_H) * tiles_wide + cell.x / TILE_W;
-            self.written.push((index as u32, tile as u32));
+            if !DENSE {
+                self.written.push((index as u32, tile as u32));
+            }
             let i = index * 4;
             let mut flags = 0u8;
             if let Some((r, g, b)) = cell.background {
@@ -399,10 +451,18 @@ impl GpuGrid {
             let blank = cell.ch == ' ' && cell.attrs & (4 | 64) == 0;
             let mut slot = 0u16;
             if !blank && cell.attrs & HIDDEN == 0 {
-                match self.slot_for(cell.ch, cell.attrs & STYLE_BITS)? {
-                    Some(s) => slot = s,
-                    None => return Ok(false),
-                }
+                let style = cell.attrs & STYLE_BITS;
+                let known = if DENSE {
+                    last_glyph.and_then(|(ch, attrs, cached)| (ch == cell.ch && attrs == style).then_some(cached))
+                } else { None };
+                slot = match known {
+                    Some(s) => s,
+                    None => match self.slot_for(cell.ch, style)? {
+                        Some(s) => s,
+                        None => return Ok(false),
+                    }
+                };
+                if DENSE { last_glyph = Some((cell.ch, style, slot)); }
             }
             let (r, g, b) = cell.color;
             self.fg[i..i + 4].copy_from_slice(&[r, g, b, (slot & 0xff) as u8]);
@@ -917,6 +977,108 @@ mod tests {
                 };
                 assert_eq!(a.damage_tiles(), want, "step {step}");
                 prev = Some((a.fg.clone(), a.bg.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_and_dense_damage_and_uploads_match_listed_frames() {
+        let (cols, rows) = (61, 23);
+        let profile = RenderProfile::Reference;
+        let mut adaptive = GpuGrid::with_profile(cols, rows, 8., profile);
+        let mut listed = GpuGrid::with_profile(cols, rows, 8., profile);
+        listed.listed_only = true;
+        for g in [&mut adaptive, &mut listed] { g.set_size(244, 184, 1.); }
+        for frame in 0..240usize {
+            let count = [0, 4, 200, cols * rows / 4, cols * rows][frame % 5];
+            let cells: Vec<_> = (0..count).map(|i| DirectCell {
+                x: (i * 7 + frame) % cols, y: (i * 3 + frame) % rows,
+                ch: ' ', color: ((i + frame) as u8, 0, 0),
+                background: (i % 3 == 0).then_some((0, frame as u8, 7)), attrs: 0,
+            }).collect();
+            for g in [&mut adaptive, &mut listed] {
+                // Simulate the previous upload, then sometimes accumulate
+                // several fills/damage reports before the next one.
+                if frame % 4 == 0 { g.upload_rows = Some([NO_ROWS; 2]); }
+                g.fill(&cells).unwrap();
+            }
+            assert_eq!(adaptive.cell_planes(), listed.cell_planes());
+            assert_eq!(adaptive.damage_tiles(), listed.damage_tiles(), "frame {frame}");
+            assert_eq!(adaptive.upload_rows, listed.upload_rows, "frame {frame}");
+            // Repeated damage must leave both kinds of history coherent.
+            assert_eq!(adaptive.damage_tiles(), listed.damage_tiles());
+        }
+    }
+
+    #[test]
+    #[ignore = "deterministic dense versus listed CPU fill/damage cost; not a runtime power measurement"]
+    fn adaptive_damage_cpu_cost() {
+        use std::time::{Duration, Instant};
+        for (cols, rows) in [(237, 61), (304, 72), (936, 279)] {
+            for percent in [3, 10, 25, 50, 75, 100] {
+                let count = cols * rows * percent / 100;
+                let mut cells: Vec<_> = (0..count).map(|i| DirectCell {
+                    x: i % cols, y: i / cols, ch: ' ', color: (1, 2, 3),
+                    background: None, attrs: 0,
+                }).collect();
+                let mut grids = [GpuGrid::with_profile(cols, rows, 8., RenderProfile::Reference), GpuGrid::with_profile(cols, rows, 8., RenderProfile::Reference)];
+                grids[0].listed_only = true;
+                for g in &mut grids { g.set_size(cols as i32 * 4, rows as i32 * 8, 1.); g.fill(&cells).unwrap(); g.damage_tiles(); }
+                let mut cost = [[Duration::ZERO; 2]; 2];
+                for frame in 0..400usize {
+                    // Half the rows keep their previous colors: exact damage
+                    // must still distinguish static dense pixels from moving.
+                    for cell in &mut cells {
+                        if cell.y % 2 == 0 { cell.color.0 = (frame * 3) as u8; }
+                    }
+                    for j in [frame % 2, 1 - frame % 2] {
+                        let start = Instant::now(); grids[j].fill(&cells).unwrap();
+                        let fill = start.elapsed(); let start = Instant::now();
+                        std::hint::black_box(grids[j].damage_tiles());
+                        if frame > 20 { cost[j][0] += fill; cost[j][1] += start.elapsed(); }
+                    }
+                    assert_eq!(grids[0].cell_planes(), grids[1].cell_planes());
+                }
+                for (kind, c) in ["listed", "adaptive"].into_iter().zip(cost) {
+                    eprintln!("ADAPTIVE {cols}x{rows} density={percent}% {kind} fill={:.2}us damage={:.2}us total={:.2}us", c[0].as_secs_f64()*1e6/379.,c[1].as_secs_f64()*1e6/379.,(c[0]+c[1]).as_secs_f64()*1e6/379.);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "paired CPU grid costs of exact real scene frames; not a physical runtime measurement"]
+    fn adaptive_scene_grid_cpu_cost() {
+        use crate::neon_scenes::{Scene, Style};
+        use crate::interactive_matrix::Sound;
+        use std::time::{Duration, Instant};
+        for (cols, rows) in [(304, 72), (936, 279)] {
+            for name in ["neon-city", "circuit-run", "sand-clock-dunes", "sand-clock-galaxy"] {
+                let mut scene = Scene::new(Style::parse(name).unwrap());
+                let mut cells = vec![];
+                let mut grids = [GpuGrid::with_profile(cols, rows, 8., RenderProfile::Clipped), GpuGrid::with_profile(cols, rows, 8., RenderProfile::Clipped)];
+                grids[0].listed_only = true;
+                for g in &mut grids { g.set_size(cols as i32 * 4, rows as i32 * 8, 1.); }
+                let mut cost = [[Duration::ZERO; 2]; 2]; let mut count = 0usize;
+                for frame in 0..180usize {
+                    let level = if frame < 90 { 0. } else { 0.3 };
+                    scene.step(0.05, Some((0.4, 0.5)), Sound { bass: level, treble: level * 0.7 });
+                    scene.draw(cols, rows, 2.17, &mut cells);
+                    let mut reports = [None, None];
+                    for j in [frame % 2, 1 - frame % 2] {
+                        let start = Instant::now(); grids[j].fill(&cells).unwrap();
+                        let fill = start.elapsed(); let start = Instant::now();
+                        reports[j] = grids[j].damage_tiles();
+                        if frame >= 30 { cost[j][0] += fill; cost[j][1] += start.elapsed(); }
+                    }
+                    assert_eq!(grids[0].cell_planes(), grids[1].cell_planes(), "{name} frame{frame}");
+                    assert_eq!(reports[0], reports[1], "{name} frame{frame}");
+                    assert_eq!(grids[0].upload_rows, grids[1].upload_rows, "{name} frame{frame}");
+                    if frame >= 30 { count += cells.len(); }
+                }
+                for (kind, c) in ["listed", "adaptive"].into_iter().zip(cost) {
+                    eprintln!("SCENE_GRID {name} {cols}x{rows} cells={} {kind} fill={:.2}us damage={:.2}us total={:.2}us", count/150, c[0].as_secs_f64()*1e6/150.,c[1].as_secs_f64()*1e6/150.,(c[0]+c[1]).as_secs_f64()*1e6/150.);
+                }
             }
         }
     }
