@@ -69,7 +69,9 @@ pub fn track_global(pointer:Arc<PointerState>, stop:Arc<AtomicBool>, output:Opti
                 Ok(p)=>match (p["x"].as_f64(),p["y"].as_f64()) { (Some(x),Some(y))=>if follow_outside { pointer.update((x-rect.x)/rect.width,(y-rect.y)/rect.height,1,1); } else { rect.feed(&pointer,x,y); }, _=>pointer.leave() },
                 Err(_)=>pointer.leave(),
             }
-            if let Some(rest)=Duration::from_millis(33).checked_sub(begin.elapsed()) { std::thread::sleep(rest); }
+            // No faster than the scene draws: a sample between frames is never seen.
+            let period=crate::max_fps().map_or(Duration::from_millis(33),|fps|Duration::from_secs_f64(1./fps.clamp(1.,30.)));
+            if let Some(rest)=period.checked_sub(begin.elapsed()) { std::thread::sleep(rest); }
         }
         pointer.leave();
     })?)

@@ -50,6 +50,9 @@ pub(crate) struct Scene {
     spawn: f32,
     serial: u32,
     showcase: Option<crate::showcase_scenes::Showcase>,
+    raster: std::cell::RefCell<Option<Raster>>,
+    /// The last depth lit and its light; a new frame starts it over.
+    glow_at: std::cell::Cell<(f32, f32, f32)>,
 }
 impl Scene {
     pub(crate) fn new(style: Style) -> Self {
@@ -62,6 +65,8 @@ impl Scene {
             accents: vec![],
             spawn: 0.,
             serial: rand::random(),
+            raster: Default::default(),
+            glow_at: std::cell::Cell::new((f32::NAN, 0., 0.)),
             showcase: match style {
                 Style::Showcase(kind) => Some(crate::showcase_scenes::Showcase::new(kind)),
                 _ => None,
@@ -69,6 +74,7 @@ impl Scene {
         }
     }
     pub(crate) fn step(&mut self, dt: f32, pointer: Option<(f32, f32)>, sound: Sound) {
+        self.glow_at.set((f32::NAN, 0., 0.));
         if let Some(show) = &mut self.showcase {
             show.step(dt, pointer, sound);
             return;
@@ -127,8 +133,13 @@ impl Scene {
         if cols == 0 || rows == 0 {
             return;
         }
+        let mut slot = self.raster.borrow_mut();
+        let r = match slot.take() {
+            Some(r) if r.fits(cols, rows) => r,
+            _ => Raster::new(cols, rows),
+        };
         let mut c = Canvas {
-            r: Raster::new(cols, rows),
+            r,
             cols,
             rows,
             aspect: aspect.clamp(1., 4.),
@@ -144,7 +155,8 @@ impl Scene {
             Style::Showcase(_) => unreachable!("delegated above"),
         }
         self.draw_accents(&mut c);
-        c.r.finish(out);
+        c.r.recycle(out);
+        *slot = Some(c.r);
     }
     fn draw_accents(&self, c: &mut Canvas) {
         for a in &self.accents {
@@ -280,10 +292,15 @@ impl Scene {
         }
     }
     fn glow(&self, color: Color, z: f32) -> Color {
-        let distance = 0.36 + 0.64 / (1. + z * 0.035);
-        // Moving pools of light reveal the beat along depth, with white headroom.
-        let wave = (0.5 + 0.5 * (z * 0.42 - self.travel * 0.35).cos()).powi(3);
-        let energy = (self.sound.treble * 0.65 + self.sound.bass * wave * 0.7).clamp(0., 1.);
+        // Whole floors of windows share a depth, and this runs for each one.
+        let (at, mut distance, mut energy) = self.glow_at.get();
+        if at != z {
+            distance = 0.36 + 0.64 / (1. + z * 0.035);
+            // Moving pools of light reveal the beat along depth, with white headroom.
+            let wave = (0.5 + 0.5 * (z * 0.42 - self.travel * 0.35).cos()).powi(3);
+            energy = (self.sound.treble * 0.65 + self.sound.bass * wave * 0.7).clamp(0., 1.);
+            self.glow_at.set((z, distance, energy));
+        }
         let base = scale(color, distance * (0.55 + energy * 0.65));
         let lift = |v: u8| (v as f32 + (255. - v as f32) * energy * 0.55) as u8;
         (lift(base.0), lift(base.1), lift(base.2))
@@ -665,8 +682,12 @@ impl Scene {
         let cx = c.cols as f32 * 0.68;
         let cy = c.horizon_y() - c.rows as f32 * 0.21;
         let radius = c.rows as f32 * 0.16;
-        for y in 0..c.rows {
-            for x in 0..c.cols {
+        // Only the moon's own rectangle: the rest of the sky is not it.
+        let span = |centre: f32, reach: f32, size: usize| {
+            ((centre - reach).floor().max(0.) as usize)..((centre + reach).ceil().max(0.) as usize + 1).min(size)
+        };
+        for y in span(cy, radius, c.rows) {
+            for x in span(cx, radius * c.aspect, c.cols) {
                 let nx = (x as f32 - cx) / (radius * c.aspect);
                 let ny = (y as f32 - cy) / radius;
                 let r2 = nx * nx + ny * ny;
@@ -1084,6 +1105,69 @@ impl Canvas {
             return;
         }
         let q = p.map(|p| self.project(p));
+        let cross = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+            (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+        };
+        // Both triangles of the quad, with what each cell would recompute.
+        let triangles = [[0, 1, 2], [0, 2, 3]].map(|ids| {
+            let [a, b, c] = ids.map(|i| q[i]);
+            let area = cross(a, b, c);
+            (a, b, c, area.abs() >= 0.00001, area.recip(), ids.map(|i| p[i].2.recip()))
+        });
+        let lo = q
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.) as usize;
+        let hi = q
+            .iter()
+            .map(|p| p.1)
+            .fold(0., f32::max)
+            .ceil()
+            .min(self.rows as f32) as usize;
+        for y in lo..hi {
+            let yy = y as f32 + 0.5;
+            let (mut low, mut high, mut hits) = (f32::INFINITY, f32::NEG_INFINITY, 0);
+            for edge in 0..4 {
+                let (a, b) = (q[edge], q[(edge + 1) % 4]);
+                if (a.1 <= yy && b.1 > yy) || (b.1 <= yy && a.1 > yy) {
+                    let hit = a.0 + (yy - a.1) * (b.0 - a.0) / (b.1 - a.1);
+                    low = low.min(hit);
+                    high = high.max(hit);
+                    hits += 1;
+                }
+            }
+            if hits < 2 {
+                continue;
+            }
+            let left = low.floor().max(0.) as usize;
+            let right = high.ceil().min(self.cols as f32) as usize;
+            for x in left..right {
+                let point = (x as f32 + 0.5, yy);
+                for &(a, b, c, usable, per_area, inverse) in &triangles {
+                    if !usable {
+                        continue;
+                    }
+                    let u = cross(point, b, c) * per_area;
+                    let v = cross(a, point, c) * per_area;
+                    let w = 1. - u - v;
+                    if u >= -0.001 && v >= -0.001 && w >= -0.001 {
+                        let z = 1. / (u * inverse[0] + v * inverse[1] + w * inverse[2]);
+                        self.r.dot(x as i32, y as i32, z, if self.solid_body { '▓' } else { '▪' }, color);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    /// The fill as first written: every cell tests both triangles from scratch.
+    #[cfg(test)]
+    fn face_reference(&mut self, p: [P; 4], color: Color) {
+        if p.iter().any(|p| p.2 < 0.6) {
+            return;
+        }
+        let q = p.map(|p| self.project(p));
 
         let lo = q
             .iter()
@@ -1142,6 +1226,15 @@ impl Canvas {
         }
     }
 }
+/// Tells a frame from the one before it. Telling them apart wrongly would hold
+/// back one frame out of 2^64, and the next one corrects it.
+fn frame_print(cells: &[DirectCell]) -> u64 {
+    cells.iter().fold(cells.len() as u64 + 1, |print, c| {
+        let (r, g, b) = c.color;
+        let cell = (c.x as u64) << 44 ^ (c.y as u64) << 32 ^ (c.ch as u64) << 8 ^ (r as u64) << 16 ^ (g as u64) << 24 ^ b as u64;
+        (print ^ cell).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+    })
+}
 pub fn run(
     style: Style,
     cols: usize,
@@ -1156,7 +1249,7 @@ pub fn run(
     let audio = crate::AudioState::start(true);
     let mut scene = Scene::new(style);
     let mut cells = vec![];
-    let mut shown: Vec<DirectCell> = vec![];
+    let mut shown = 0;
     let mut last = Instant::now();
     let mut seen = false;
     eprintln!("neon scene: {style:?}, audio reactive");
@@ -1173,8 +1266,10 @@ pub fn run(
         scene.step(dt, pointer.sample(), sound);
         scene.draw(cols, rows, aspect, &mut cells);
         // A still frame costs the GPU and the battery nothing if never sent.
-        if cells != shown {
-            shown.clone_from(&cells);
+        // The print saves keeping a copy of every frame just to compare it.
+        let print = frame_print(&cells);
+        if print != shown {
+            shown = print;
             let mut slot = snapshot.lock().unwrap();
             if stop.load(Ordering::Acquire) {
                 break;
@@ -1193,6 +1288,170 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_frame_print_only_matches_the_same_frame() {
+        let cell = |x, ch, color| DirectCell { x, y: 3, ch, color, background: None, attrs: 1 };
+        let frame = vec![cell(1, 'a', (1, 2, 3)), cell(2, 'b', (4, 5, 6))];
+        assert_eq!(frame_print(&frame), frame_print(&frame.clone()));
+        assert_ne!(frame_print(&frame), frame_print(&[]));
+        for other in [
+            vec![cell(1, 'a', (1, 2, 3))],
+            vec![cell(1, 'a', (1, 2, 4)), cell(2, 'b', (4, 5, 6))],
+            vec![cell(1, 'c', (1, 2, 3)), cell(2, 'b', (4, 5, 6))],
+            vec![cell(1, 'a', (1, 2, 3)), cell(3, 'b', (4, 5, 6))],
+            vec![cell(2, 'b', (4, 5, 6)), cell(1, 'a', (1, 2, 3))],
+        ] {
+            assert_ne!(frame_print(&frame), frame_print(&other));
+        }
+    }
+
+    // cargo test --release clock_frame_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual cost report"]
+    fn clock_frame_cost() {
+        let (cols, rows, aspect) = (936, 279, 2.17);
+        let names = std::env::var("CLOCKS").unwrap_or_else(|_| {
+            "sand-clock sand-clock-chladni sand-clock-dunes sand-clock-galaxy".into()
+        });
+        for name in names.split_whitespace() {
+            let mut scene = Scene::new(Style::parse(name).unwrap());
+            let mut out = vec![];
+            scene.draw(cols, rows, aspect, &mut out);
+            let level: f32 = std::env::var("LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+            let sound = Sound { bass: level, treble: level * 0.7 };
+            for _ in 0..200 {
+                scene.step(0.01, Some((0.4, 0.5)), sound);
+                scene.draw(cols, rows, aspect, &mut out);
+            }
+            let (mut step, mut draw, mut print) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let frames = 500;
+            let mut sink = 0u64;
+            for _ in 0..frames {
+                let t = Instant::now();
+                scene.step(0.01, Some((0.4, 0.5)), sound);
+                step += t.elapsed();
+                let t = Instant::now();
+                scene.draw(cols, rows, aspect, &mut out);
+                draw += t.elapsed();
+                let t = Instant::now();
+                sink ^= frame_print(&out);
+                print += t.elapsed();
+            }
+            let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
+            eprintln!(
+                "CLOCK {name:<20} step {:6.3} draw {:6.3} print {:6.3} total {:6.3} ms cells {} ({sink:x})",
+                ms(step), ms(draw), ms(print), ms(step + draw + print), out.len()
+            );
+        }
+    }
+    // cargo test --release grid_frame_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual cost report"]
+    fn grid_frame_cost() {
+        use crate::gpu_grid::GpuGrid;
+        let (cols, rows, aspect) = (936, 279, 2.17);
+        let names = std::env::var("CLOCKS").unwrap_or_else(|_| {
+            "sand-clock sand-clock-chladni sand-clock-dunes sand-clock-galaxy".into()
+        });
+        for name in names.split_whitespace() {
+            let mut scene = Scene::new(Style::parse(name).unwrap());
+            let mut grid = GpuGrid::with_profile(cols, rows, 8., crate::render_profile::RenderProfile::Clipped);
+            grid.set_size(3456, 2234, 2.);
+            let mut out = vec![];
+            scene.draw(cols, rows, aspect, &mut out);
+            let level: f32 = std::env::var("LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+            let sound = Sound { bass: level, treble: level * 0.7 };
+            let frames: Vec<Vec<DirectCell>> = (0..300).map(|_| {
+                scene.step(0.01, Some((0.4, 0.5)), sound);
+                scene.draw(cols, rows, aspect, &mut out);
+                out.clone()
+            }).collect();
+            for f in &frames[..50] { grid.fill(f).unwrap(); let _ = grid.damage_tiles(); }
+            let (mut fill, mut damage, mut rects) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let mut n = 0;
+            for f in &frames[50..] {
+                let t = Instant::now();
+                grid.fill(f).unwrap();
+                fill += t.elapsed();
+                let t = Instant::now();
+                let tiles = grid.damage_tiles();
+                damage += t.elapsed();
+                let t = Instant::now();
+                n += tiles.map(|t| grid.tiles_to_rects(&t).len()).unwrap_or(0);
+                rects += t.elapsed();
+            }
+            let ms = |d: Duration| d.as_secs_f64() * 1000. / 250.;
+            eprintln!("GRID {name:<20} fill {:6.3} damage {:6.3} rects {:6.3} ms  rects/frame {}", ms(fill), ms(damage), ms(rects), n / 250);
+        }
+    }
+    #[test]
+    fn lit_depths_are_not_remembered_across_frames() {
+        let mut scene = Scene::new(Style::City);
+        let loud = Sound { bass: 0.8, treble: 0.5 };
+        for _ in 0..20 {
+            scene.step(0.05, None, loud);
+        }
+        let first = scene.glow((200, 200, 200), 7.);
+        assert_eq!(first, scene.glow((200, 200, 200), 7.));
+        scene.step(0.5, None, Sound { bass: 0., treble: 0. });
+        for _ in 0..20 {
+            scene.step(0.05, None, Sound { bass: 0., treble: 0. });
+        }
+        assert_ne!(first, scene.glow((200, 200, 200), 7.));
+    }
+    #[test]
+    fn the_faster_face_fill_paints_the_same_cells() {
+        let canvas = || Canvas {
+            r: Raster::new(310, 96),
+            cols: 310,
+            rows: 96,
+            aspect: 1.75,
+            gaze: (0.1, -0.2),
+            style: Style::City,
+            solid_body: false,
+        };
+        let quads: [[P; 4]; 3] = [
+            [(4.2, 2.2, 6.), (8., 2.2, 6.), (8., -3., 6.), (4.2, -3., 6.)],
+            [(4.2, 2.2, 6.), (4.2, -3., 6.), (4.2, -3., 10.5), (4.2, 2.2, 10.5)],
+            [(-4., 2.2, 3.), (4., 2.2, 3.), (4., 2.2, 9.), (-4., 2.2, 9.)],
+        ];
+        for quad in quads {
+            let (mut a, mut b) = (canvas(), canvas());
+            a.face(quad, (10, 20, 30));
+            b.face_reference(quad, (10, 20, 30));
+            let (mut fast, mut slow) = (vec![], vec![]);
+            a.r.finish(&mut fast);
+            b.r.finish(&mut slow);
+            assert!(fast.len() > 50);
+            assert_eq!(fast, slow);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn neon_frame_cost() {
+        use crate::interactive_matrix::Sound;
+        for style in [Style::City, Style::Vector, Style::Circuit, Style::Sunset] {
+            let mut scene = Scene::new(style);
+            let loud = Sound { bass: 0.6, treble: 0.5 };
+            let mut out = vec![];
+            for _ in 0..240 {
+                scene.step(1. / 20., Some((0.4, 0.5)), loud);
+            }
+            let (mut step, mut draw) = (Duration::ZERO, Duration::ZERO);
+            let frames = 200;
+            for _ in 0..frames {
+                let t = Instant::now();
+                scene.step(1. / 20., Some((0.4, 0.5)), loud);
+                step += t.elapsed();
+                let t = Instant::now();
+                scene.draw(310, 96, 1.75, &mut out);
+                draw += t.elapsed();
+            }
+            let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
+            eprintln!("COST {style:?} step {:.3} ms draw {:.3} ms cells {}", ms(step), ms(draw), out.len());
+        }
+    }
     #[test]
     fn lunar_foreground_stays_contiguous_through_every_scroll_phase() {
         for tick in 0..300 {

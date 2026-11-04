@@ -68,6 +68,7 @@ struct Crash {
 }
 pub(crate) struct Tunnel {
     crashes: [Option<Crash>; BIKES as usize],
+    raster: std::cell::RefCell<Option<Raster>>,
     time: f32,
     travel: f32,
     gaze: (f32, f32),
@@ -80,6 +81,7 @@ impl Tunnel {
     pub(crate) fn new() -> Self {
         Self {
             crashes: [None; BIKES as usize],
+            raster: Default::default(),
             time: 0.,
             travel: 0.,
             gaze: (0., 0.),
@@ -188,11 +190,10 @@ impl Tunnel {
         if cols == 0 || rows == 0 {
             return;
         }
-        let mut raster = Raster {
-            cols,
-            rows,
-            depth: vec![f32::INFINITY; cols * rows],
-            cells: vec![None; cols * rows],
+        let mut slot = self.raster.borrow_mut();
+        let mut raster = match slot.take() {
+            Some(r) if r.fits(cols, rows) => r,
+            _ => Raster::new(cols, rows),
         };
         let spacing = 1.8;
         let phase = self.travel % spacing;
@@ -401,7 +402,8 @@ impl Tunnel {
                 self.draw_crash(&mut raster, crash, bike_color(bike), cols, rows, aspect);
             }
         }
-        cells.extend(raster.cells.into_iter().flatten());
+        raster.recycle(cells);
+        *slot = Some(raster);
     }
     /// The bike bursts into shards where it hit, and what it laid falls apart.
     fn draw_crash(&self, raster: &mut Raster, crash: Crash, color: (u8, u8, u8), cols: usize, rows: usize, aspect: f32) {
@@ -466,11 +468,56 @@ impl Tunnel {
         }
     }
 }
+/// The part of a segment from `a` along `d` inside `[0, right] x [0, bottom]`,
+/// as fractions of it; empty when `lo > hi`. A segment already inside, as most
+/// are, needs none of the four divisions: the general case gives 0 and 1 too.
+fn clip_span(a: (f32, f32), d: (f32, f32), right: f32, bottom: f32) -> (f32, f32) {
+    let inside = |x: f32, y: f32| x >= 0. && y >= 0. && x <= right && y <= bottom;
+    if inside(a.0, a.1) && inside(a.0 + d.0, a.1 + d.1) {
+        return (0., 1.);
+    }
+    clip_span_general(a, d, right, bottom)
+}
+fn clip_span_general(a: (f32, f32), d: (f32, f32), right: f32, bottom: f32) -> (f32, f32) {
+    let (mut lo, mut hi) = (0f32, 1f32);
+    for (p, q) in [(-d.0, a.0), (d.0, right - a.0), (-d.1, a.1), (d.1, bottom - a.1)] {
+        if p == 0. {
+            if q < 0. {
+                return (1., 0.);
+            }
+        } else {
+            let t = q / p;
+            if p < 0. {
+                lo = lo.max(t);
+            } else {
+                hi = hi.min(t);
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// `v.round()` for what a clipped line walks: nothing below zero. Generic
+/// x86-64 has no rounding instruction, so `round` is a call per cell.
+fn nearest(v: f32) -> usize {
+    let whole = v as usize;
+    whole + usize::from(v - whole as f32 >= 0.5)
+}
+#[derive(Clone, Copy, Default)]
+struct Mark {
+    ch: char,
+    color: (u8, u8, u8),
+}
 pub(crate) struct Raster {
     cols: usize,
     rows: usize,
     depth: Vec<f32>,
-    cells: Vec<Option<DirectCell>>,
+    /// Only what a cell adds to its position: at a few frames a second this
+    /// buffer is cold, and every byte per cell shows up as a cache miss.
+    marks: Vec<Mark>,
+    /// One bit per cell drawn this frame. A frame touches a fraction of the
+    /// grid, and only that fraction is read back and cleared.
+    drawn: Vec<u64>,
 }
 impl Raster {
     pub(crate) fn new(cols: usize, rows: usize) -> Self {
@@ -478,7 +525,8 @@ impl Raster {
             cols,
             rows,
             depth: vec![f32::INFINITY; cols * rows],
-            cells: vec![None; cols * rows],
+            marks: vec![Mark::default(); cols * rows],
+            drawn: vec![0; (cols * rows).div_ceil(64)],
         }
     }
     pub(crate) fn fits(&self, cols: usize, rows: usize) -> bool {
@@ -486,13 +534,39 @@ impl Raster {
     }
     /// Hand over the frame and leave the buffers ready for the next one.
     pub(crate) fn recycle(&mut self, out: &mut Vec<DirectCell>) {
-        out.clear();
-        out.extend(self.cells.iter_mut().filter_map(Option::take));
-        self.depth.fill(f32::INFINITY);
+        self.drain(out, false);
     }
-    pub(crate) fn finish(self, out: &mut Vec<DirectCell>) {
+    /// As `recycle`, less blank black cells: those only hid what was behind
+    /// them and are the same pixels as no cell at all.
+    pub(crate) fn recycle_visible(&mut self, out: &mut Vec<DirectCell>) {
+        self.drain(out, true);
+    }
+    fn drain(&mut self, out: &mut Vec<DirectCell>, skip_blank: bool) {
         out.clear();
-        out.extend(self.cells.into_iter().flatten());
+        for (word, bits) in self.drawn.iter_mut().enumerate() {
+            let mut left = std::mem::take(bits);
+            while left != 0 {
+                let i = word * 64 + left.trailing_zeros() as usize;
+                left &= left - 1;
+                self.depth[i] = f32::INFINITY;
+                let Mark { ch, color } = self.marks[i];
+                if skip_blank && ch == ' ' && color == (0, 0, 0) {
+                    continue;
+                }
+                out.push(DirectCell {
+                    x: i % self.cols,
+                    y: i / self.cols,
+                    ch,
+                    color,
+                    background: None,
+                    attrs: 1,
+                });
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn finish(mut self, out: &mut Vec<DirectCell>) {
+        self.recycle(out);
     }
     pub(crate) fn dot(&mut self, x: i32, y: i32, z: f32, ch: char, color: (u8, u8, u8)) {
         if x < 0 || y < 0 || x as usize >= self.cols || y as usize >= self.rows {
@@ -501,14 +575,8 @@ impl Raster {
         let i = y as usize * self.cols + x as usize;
         if z < self.depth[i] {
             self.depth[i] = z;
-            self.cells[i] = Some(DirectCell {
-                x: x as usize,
-                y: y as usize,
-                ch,
-                color,
-                background: None,
-                attrs: 1,
-            });
+            self.drawn[i / 64] |= 1 << (i % 64);
+            self.marks[i] = Mark { ch, color };
         }
     }
 
@@ -536,26 +604,7 @@ impl Raster {
         }
         // Clip before walking: near geometry can project far beyond the viewport.
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let (mut lo, mut hi) = (0f32, 1f32);
-        for (p, q) in [
-            (-dx, a.0),
-            (dx, self.cols as f32 - 1. - a.0),
-            (-dy, a.1),
-            (dy, self.rows as f32 - 1. - a.1),
-        ] {
-            if p == 0. {
-                if q < 0. {
-                    return;
-                }
-            } else {
-                let t = q / p;
-                if p < 0. {
-                    lo = lo.max(t);
-                } else {
-                    hi = hi.min(t);
-                }
-            }
-        }
+        let (lo, hi) = clip_span(a, (dx, dy), self.cols as f32 - 1., self.rows as f32 - 1.);
         if lo > hi {
             return;
         }
@@ -578,23 +627,13 @@ impl Raster {
         let ch = glyph.unwrap_or(ch);
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
-            let x = (start.0 + (end.0 - start.0) * t)
-                .round()
-                .clamp(0., self.cols as f32 - 1.) as usize;
-            let y = (start.1 + (end.1 - start.1) * t)
-                .round()
-                .clamp(0., self.rows as f32 - 1.) as usize;
+            let x = nearest(start.0 + (end.0 - start.0) * t).min(self.cols - 1);
+            let y = nearest(start.1 + (end.1 - start.1) * t).min(self.rows - 1);
             let index = y * self.cols + x;
             if z < self.depth[index] {
                 self.depth[index] = z;
-                self.cells[index] = Some(DirectCell {
-                    x,
-                    y,
-                    ch,
-                    color,
-                    background: None,
-                    attrs: 1,
-                });
+                self.drawn[index / 64] |= 1 << (index % 64);
+                self.marks[index] = Mark { ch, color };
             }
         }
     }
@@ -743,6 +782,88 @@ mod tests {
     }
 
     #[test]
+    fn the_visible_hand_over_only_leaves_out_black_blanks() {
+        let mut seed = 7u32;
+        let mut next = move |n: u32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) % n
+        };
+        for (cols, rows) in [(1, 9), (7, 5), (63, 4), (64, 3), (65, 7), (936, 279)] {
+            let (mut a, mut b, mut c) = (Raster::new(cols, rows), Raster::new(cols, rows), Raster::new(cols, rows));
+            let (mut fast, mut slow, mut visible) = (vec![], vec![], vec![]);
+            for _ in 0..20 {
+                for _ in 0..next((cols * rows) as u32 / 2 + 2) {
+                    let (x, y) = (next(cols as u32 + 2) as i32 - 1, next(rows as u32 + 2) as i32 - 1);
+                    let (z, ch) = (next(9) as f32, [' ', 'a', '█'][next(3) as usize]);
+                    let color = [(0, 0, 0), (1, 2, 3)][next(2) as usize];
+                    for r in [&mut a, &mut b, &mut c] {
+                        r.dot(x, y, z, ch, color);
+                    }
+                }
+                a.recycle(&mut fast);
+                b.recycle(&mut slow);
+                c.recycle_visible(&mut visible);
+                assert_eq!(fast, slow);
+                slow.retain(|cell| !(cell.ch == ' ' && cell.color == (0, 0, 0)));
+                assert_eq!(visible, slow);
+            }
+        }
+    }
+
+    #[test]
+    fn the_inside_shortcut_clips_like_the_general_case() {
+        let mut seed = 99u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / 16777216.
+        };
+        for _ in 0..2_000_000 {
+            let a = (next() * 320. - 10., next() * 110. - 10.);
+            let b = (next() * 320. - 10., next() * 110. - 10.);
+            let d = (b.0 - a.0, b.1 - a.1);
+            let general = clip_span_general(a, d, 299., 89.);
+            let fast = clip_span(a, d, 299., 89.);
+            assert!(fast == general || (fast.0 > fast.1 && general.0 > general.1), "{a:?} {b:?} {fast:?} {general:?}");
+        }
+    }
+
+    #[test]
+    fn nearest_rounds_like_round() {
+        for i in 0..2_000_000u32 {
+            let v = i as f32 * 0.00131;
+            assert_eq!(nearest(v), v.round() as usize, "{v}");
+        }
+        for v in [-0.0, -0.3, 0.5, 0.49999997, 1.5, 2.5, 4095.5] {
+            assert_eq!(nearest(v), v.round().max(0.) as usize, "{v}");
+        }
+    }
+
+    #[test]
+    fn a_reused_raster_matches_a_fresh_one_cell_for_cell() {
+        let mut reused = Raster::new(97, 41);
+        let mut seed = 7u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for frame in 0..50 {
+            let mut fresh = Raster::new(97, 41);
+            for _ in 0..600 + frame * 40 {
+                let (x, y) = ((next() % 110) as i32 - 6, (next() % 50) as i32 - 4);
+                let (z, ch) = ((next() % 100) as f32, char::from(33 + (next() % 90) as u8));
+                reused.dot(x, y, z, ch, (1, 2, 3));
+                fresh.dot(x, y, z, ch, (1, 2, 3));
+            }
+            let (mut a, mut b) = (vec![], vec![]);
+            reused.recycle(&mut a);
+            fresh.finish(&mut b);
+            assert_eq!(a, b, "frame {frame}");
+            assert!(a.windows(2).all(|p| (p[0].y, p[0].x) < (p[1].y, p[1].x)));
+        }
+        assert!(reused.drawn.iter().all(|w| *w == 0));
+    }
+
+    #[test]
     fn a_route_holds_its_lane_and_turns_smoothly() {
         for seed in 0..20 {
             let mut held = 0;
@@ -782,13 +903,8 @@ mod tests {
         let near = t.project(3.2, 0., 2., 174, 50, 1.75);
         let far = t.project(3.2, 0., 30., 174, 50, 1.75);
         assert!((near.0 - 87.).abs() > (far.0 - 87.).abs());
-        let mut r = Raster {
-            cols: 10,
-            rows: 10,
-            depth: vec![f32::INFINITY; 100],
-            cells: vec![None; 100],
-        };
+        let mut r = Raster::new(10, 10);
         r.line((-1e9, 5.), (1e9, 5.), 1., (1, 2, 3), true);
-        assert!(r.cells.iter().flatten().count() <= 10);
+        assert!(r.drawn.iter().map(|w| w.count_ones()).sum::<u32>() <= 10);
     }
 }

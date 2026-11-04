@@ -623,6 +623,13 @@ pub fn run(
                                     _ => None,
                                 };
                                 let clip = if bench_full_clip { None } else { clip };
+                                // Every clip rectangle is its own draw call. Once they
+                                // cover most of the surface, one full draw is cheaper than
+                                // the calls, and repainting unchanged cells changes nothing.
+                                let clip = clip.filter(|rects| {
+                                    let covered: i64 = rects.iter().map(|r| r[2] as i64 * r[3] as i64).sum();
+                                    covered * 2 < buffer.0 as i64 * buffer.1 as i64
+                                });
                                 if bench_draw {
                                     pipeline.draw(&mut grid, true, spec.opaque, clip.as_deref());
                                 }

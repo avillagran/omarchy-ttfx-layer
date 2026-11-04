@@ -340,3 +340,120 @@ fn optimized_profiles_backend_compile_failure_uses_reference(){unsafe{
     }
     FORCE_BACKEND_SHADER_FAILURE.with(|fail|fail.set(false));assert_eq!(gl::GetError(),gl::NO_ERROR);
 }}
+
+/// Damage-driven partial redraws and row-span uploads (the product loop: fill,
+/// damage tiles, clip) on a coherent previous image must equal the same loop
+/// on a second pipeline and a full redraw from whole-plane uploads.
+unsafe fn damage_redraw_pair(cols:usize,rows:usize,w:i32,h:i32,opaque:bool,steps:usize,oracle_full:bool)->(Vec<Vec<u8>>,Vec<Vec<u8>>,Vec<u64>) {
+    let mut candidate=GpuPipeline::with_profile(true,RenderProfile::Clipped).unwrap();
+    // Oracle: the same exact cell mapping, with the same clips or a full redraw.
+    let mut reference=GpuPipeline::with_profile(true,RenderProfile::Clipped).unwrap();
+    let(mut a,mut b)=(GpuGrid::with_profile(cols,rows,8.,RenderProfile::Clipped),GpuGrid::with_profile(cols,rows,8.,RenderProfile::Clipped));
+    a.set_size(w,h,1.);b.set_size(w,h,1.);
+    let(mut textures,mut fbos)=([0;2],[0;2]);gl::GenTextures(2,textures.as_mut_ptr());gl::GenFramebuffers(2,fbos.as_mut_ptr());
+    for i in 0..2 {
+        gl::ActiveTexture(gl::TEXTURE0);gl::BindTexture(gl::TEXTURE_2D,textures[i]);
+        gl::TexImage2D(gl::TEXTURE_2D,0,gl::RGBA8 as i32,w,h,0,gl::RGBA,gl::UNSIGNED_BYTE,std::ptr::null());
+        gl::BindFramebuffer(gl::FRAMEBUFFER,fbos[i]);gl::FramebufferTexture2D(gl::FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,textures[i],0);
+        assert_eq!(gl::CheckFramebufferStatus(gl::FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE);
+        gl::ClearColor(0.13,0.21,0.34,0.55);gl::Clear(gl::COLOR_BUFFER_BIT);
+    }
+    gl::Viewport(0,0,w,h);
+    let glyphs=['A','█','あ',' ','_','界','M','|','.'];
+    let mut cells:Vec<DirectCell>=(0..cols*rows).filter(|i|i%4!=1).map(|i|DirectCell{
+        x:i%cols,y:i/cols,ch:glyphs[i%glyphs.len()],color:((i%251)as u8,120,220),
+        background:if i%3==0{Some((30,60,90))}else{None},attrs:[0,1,4,64,32][i%5],
+    }).collect();
+    let mut seed=0x9e3779b9u64;let mut next=||{seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;seed};
+    let(mut got,mut want,mut calls)=(vec![],vec![],vec![]);
+    for step in 0..steps {
+        if step>0 && !cells.is_empty() {
+            // Scattered changes: a few hundred cells, erasures and moves.
+            for _ in 0..[3,40,400,1500][step%4] {
+                let i=(next() as usize)%cells.len();
+                match next()%4 {
+                    0=>cells[i].ch=glyphs[(next() as usize)%glyphs.len()],
+                    1=>cells[i].color=((next()%256)as u8,(next()%256)as u8,7),
+                    2=>cells[i].background=if next()%2==0{None}else{Some((9,(next()%256)as u8,40))},
+                    _=>{cells[i].x=(next() as usize)%cols;cells[i].y=(next() as usize)%rows;}
+                }
+            }
+            if step%5==0 {cells.truncate(cells.len()*9/10);}
+        }
+        a.fill(&cells).unwrap();b.fill(&cells).unwrap();
+        let clip=a.damage_tiles().map(|tiles|a.tiles_to_rects(&tiles));
+        // The full-redraw oracle never runs damage_tiles: it uploads whole planes.
+        let oracle_clip=if oracle_full{None}else{b.damage_tiles().map(|tiles|b.tiles_to_rects(&tiles))};
+        if !oracle_full {assert_eq!(clip,oracle_clip);}
+        gl::BindFramebuffer(gl::FRAMEBUFFER,fbos[0]);candidate.draw(&mut a,true,opaque,clip.as_deref());
+        calls.push(candidate.last_draw_work()[2]);
+        let mut pixels=vec![0;w as usize*h as usize*4];gl::ReadPixels(0,0,w,h,gl::RGBA,gl::UNSIGNED_BYTE,pixels.as_mut_ptr().cast());got.push(pixels);
+        gl::BindFramebuffer(gl::FRAMEBUFFER,fbos[1]);reference.draw(&mut b,true,opaque,if oracle_full{None}else{oracle_clip.as_deref()});
+        let mut pixels=vec![0;w as usize*h as usize*4];gl::ReadPixels(0,0,w,h,gl::RGBA,gl::UNSIGNED_BYTE,pixels.as_mut_ptr().cast());want.push(pixels);
+        assert_eq!(gl::GetError(),gl::NO_ERROR);
+    }
+    gl::BindFramebuffer(gl::FRAMEBUFFER,0);gl::DeleteFramebuffers(2,fbos.as_ptr());gl::DeleteTextures(2,textures.as_ptr());
+    (got,want,calls)
+}
+#[test]
+#[ignore="damage redraws and row-span uploads on coherent buffers equal full redraws"]
+fn damage_redraws_match_full_redraw(){unsafe{
+    let _context=Sandbox::new();
+    for (cols,rows,w,h) in [(237,61,2560,1600),(284,88,2560,1600),(80,24,511,383),(80,24,17,13),(1,1,97,59)] {
+        for opaque in [true,false] {
+            let(got,want,calls)=damage_redraw_pair(cols,rows,w,h,opaque,11,false);
+            assert_pixels_equal(&want,&got,&format!("damage loop twice {cols}x{rows} {w}x{h} opaque{opaque}"));
+            let(got,want,_)=damage_redraw_pair(cols,rows,w,h,opaque,11,true);
+            assert_pixels_equal(&want,&got,&format!("damage loop vs full redraw {cols}x{rows} {w}x{h} opaque{opaque}"));
+            eprintln!("DAMAGE_GATE {cols}x{rows} {w}x{h} opaque{opaque} draw_calls={calls:?}");
+        }
+    }
+}}
+
+unsafe fn texture_bytes(tex:u32,cols:i32,rows:i32)->Vec<u8> {
+    let mut fbo=0;gl::GenFramebuffers(1,&mut fbo);gl::BindFramebuffer(gl::FRAMEBUFFER,fbo);
+    gl::FramebufferTexture2D(gl::FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,tex,0);
+    assert_eq!(gl::CheckFramebufferStatus(gl::FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE);
+    let mut bytes=vec![0;cols as usize*rows as usize*4];
+    gl::ReadPixels(0,0,cols,rows,gl::RGBA,gl::UNSIGNED_BYTE,bytes.as_mut_ptr().cast());
+    gl::BindFramebuffer(gl::FRAMEBUFFER,0);gl::DeleteFramebuffers(1,&fbo);
+    bytes
+}
+#[test]
+#[ignore="row-span uploads: cell textures equal the CPU planes after any fill/damage/draw/resize order"]
+fn partial_uploads_keep_cell_textures_exact(){unsafe{
+    let _context=Sandbox::new();
+    for profile in [RenderProfile::Reference,RenderProfile::Clipped,RenderProfile::Axis] {
+        let mut pipeline=GpuPipeline::with_profile(true,profile).unwrap();
+        let mut grid=GpuGrid::with_profile(40,20,8.,profile);
+        let(mut cols,mut w)=(40usize,400);grid.set_size(w,200,1.);gl::Viewport(0,0,w,200);
+        let mut seed=0x2545f4914f6cdd1du64;let mut next=||{seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;seed};
+        // A few recurring frames make "changed, then changed back" common.
+        let frames:Vec<Vec<DirectCell>>=(0..4).map(|f|(0..60).map(|i|DirectCell{x:(i*7+f*3)%40,y:(i*3+f*f)%20,
+            ch:['a','b','█','界'][(i+f)%4],color:(f as u8*60,i as u8,9),background:if (i+f)%3==0{Some((1,f as u8,3))}else{None},attrs:0}).collect()).collect();
+        let(mut sent,mut partial)=(0,0);
+        for step in 0..2000 {
+            match next()%7 {
+                0|1|2=>{grid.fill(&frames[(next()%4) as usize]).unwrap();}
+                3|4=>{let _=grid.damage_tiles();}
+                5=>{
+                    pipeline.draw(&mut grid,true,true,None);sent+=1;
+                    let bytes=pipeline.last_cell_upload_bytes();
+                    if bytes[0]+bytes[1]<grid.fg.len()*2 {partial+=1;}
+                    let(c,r)=(pipeline.grid.0,pipeline.grid.1);
+                    assert_eq!(texture_bytes(pipeline.fg_tex,c,r),grid.fg,"fg texture {profile:?} step{step}");
+                    assert_eq!(texture_bytes(pipeline.bg_tex,c,r),grid.bg,"bg texture {profile:?} step{step}");
+                }
+                _=>if next()%8==0 {
+                    // Resize: new grid geometry and atlas.
+                    cols=if cols==40{39}else{40};w=cols as i32*10;
+                    grid=if next()%2==0{GpuGrid::with_profile(cols,20,8.,profile)}else{grid};
+                    grid.set_size(w,200,1.);gl::Viewport(0,0,w,200);
+                },
+            }
+            assert_eq!(gl::GetError(),gl::NO_ERROR);
+        }
+        eprintln!("PARTIAL_UPLOAD_GATE {profile:?} draws={sent} partial={partial}");
+        assert!(partial>20&&partial<sent);
+    }
+}}

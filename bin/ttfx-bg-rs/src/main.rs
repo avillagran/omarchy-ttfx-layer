@@ -2307,6 +2307,8 @@ struct Screen {
     occupied: Option<DirectOccupancy>,
     snapshot_gen: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // Headless previews publish runs of cells when the subscriber asked for them.
+    preview_runs: bool,
 }
 
 impl Screen {
@@ -2334,6 +2336,7 @@ impl Screen {
             occupied: None,
             snapshot_gen: None,
             stop_flag: None,
+            preview_runs: false,
         }
     }
     // Headless grid for the preview daemon: no alt-screen, no cursor codes,
@@ -2394,25 +2397,29 @@ impl Screen {
             occupied: None,
             snapshot_gen: None,
             stop_flag: None,
+            preview_runs: false,
         }
     }
-    // Serialize painted cells as the preview protocol's "x,y,ch,#rrggbb;…".
+    // Serialize painted cells in the preview protocol. Each distinct SGR is
+    // read once: parsing and formatting per cell cost more than the scene.
     fn dump_cells(&self) -> String {
-        let mut out = String::with_capacity(self.cols * self.rows * 6);
+        let mut colors: std::collections::HashMap<&str, Option<(u8, u8, u8)>> = std::collections::HashMap::new();
+        let mut frame = Vec::new();
         for y in 0..self.rows {
             for x in 0..self.cols {
                 let ch = self.grid[y][x];
                 if ch == ' ' {
                     continue;
                 }
-                let Some((r, g, b)) = ansi_sgr_to_rgb(&self.color[y][x]) else {
+                let sgr = self.color[y][x].as_str();
+                let Some(color) = *colors.entry(sgr).or_insert_with(|| ansi_sgr_to_rgb(sgr)) else {
                     continue;
                 };
-                out.push_str(&format!("{x},{y},"));
-                json_push_escaped_char(&mut out, ch);
-                out.push_str(&format!(",#{r:02x}{g:02x}{b:02x};"));
+                frame.push(DirectCell { x, y, ch, color, background: None, attrs: 0 });
             }
         }
+        let mut out = String::new();
+        if self.preview_runs { encode_preview_runs(&frame, &mut out) } else { encode_preview_cells(&frame, &mut out) }
         out
     }
     // Call once per frame; draw the FPS readout at bottom-left, clear of the
@@ -4149,6 +4156,76 @@ fn parse_direct_cells(snapshot: &str, cols: usize, rows: usize) -> Vec<DirectCel
     cells
 }
 
+/// One preview frame as `x,y,ch,#rrggbb;` records, written by hand: through
+/// `write!` each cell paid for the general formatting machinery.
+// Decimal digits by hand: the formatting machinery cost more than the scene.
+fn push_number(out: &mut String, mut n: usize) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 { break; }
+    }
+    out.push_str(std::str::from_utf8(&digits[at..]).unwrap());
+}
+
+fn encode_preview_cells(frame: &[DirectCell], out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let number = push_number;
+    out.clear();
+    out.reserve(frame.len() * 18);
+    for c in frame {
+        let (ch, color) = c.background.map(|b| ('█', b)).unwrap_or((c.ch, c.color));
+        number(out, c.x);
+        out.push(',');
+        number(out, c.y);
+        out.push(',');
+        json_push_escaped_char(out, ch);
+        out.push_str(",#");
+        for byte in [color.0, color.1, color.2] {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        out.push(';');
+    }
+}
+
+// The same cells as encode_preview_cells, with consecutive cells of one colour
+// on a row sent together: "x,y,#rrggbb,count,characters;". Counted in
+// characters, so the text needs no separators of its own.
+fn encode_preview_runs(frame: &[DirectCell], out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.clear();
+    out.reserve(frame.len() * 4);
+    let mut at = 0;
+    while at < frame.len() {
+        let paint = |c: &DirectCell| c.background.map(|b| ('█', b)).unwrap_or((c.ch, c.color));
+        let (first, color) = (&frame[at], paint(&frame[at]).1);
+        let mut end = at + 1;
+        while end < frame.len() && frame[end].y == first.y && frame[end].x == frame[end - 1].x + 1 && paint(&frame[end]).1 == color {
+            end += 1;
+        }
+        push_number(out, first.x);
+        out.push(',');
+        push_number(out, first.y);
+        out.push_str(",#");
+        for byte in [color.0, color.1, color.2] {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        out.push(',');
+        push_number(out, end - at);
+        out.push(',');
+        for cell in &frame[at..end] {
+            json_push_escaped_char(out, paint(cell).0);
+        }
+        out.push(';');
+        at = end;
+    }
+}
+
 fn json_push_escaped_char(out: &mut String, ch: char) {
     match ch {
         '"' => out.push_str("\\\""),
@@ -4220,6 +4297,144 @@ fn preview_catalog_input(ambient: bool, cols: usize, rows: usize) -> String {
 }
 #[cfg(test)]
 mod ambient_preview_tests {
+    #[test]
+    fn hand_encoding_matches_the_formatted_one() {
+        use std::fmt::Write;
+        let mut seed = 7u32;
+        let mut next = move || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed >> 8 };
+        let chars = ['a', '"', '\\', '\u{1}', '█', '▬', '╱', ' ', '9', ','];
+        let frame: Vec<DirectCell> = (0..5000).map(|i| DirectCell {
+            x: (next() % 1000) as usize, y: (next() % 300) as usize, ch: chars[i % chars.len()],
+            color: ((next() & 255) as u8, (next() & 255) as u8, (next() & 255) as u8),
+            background: if i % 7 == 0 { Some(((next() & 255) as u8, 3, 250)) } else { None }, attrs: 1,
+        }).collect();
+        let mut expected = String::new();
+        for c in &frame {
+            let (ch, color) = c.background.map(|b| ('█', b)).unwrap_or((c.ch, c.color));
+            let _ = write!(expected, "{},{},", c.x, c.y);
+            super::json_push_escaped_char(&mut expected, ch);
+            let _ = write!(expected, ",#{:02x}{:02x}{:02x};", color.0, color.1, color.2);
+        }
+        let mut fast = String::from("stale");
+        super::encode_preview_cells(&frame, &mut fast);
+        assert_eq!(fast, expected);
+    }
+
+    // Reads either wire format back into (x, y, char, colour) cells.
+    fn decode(wire: &str, runs: bool) -> Vec<(usize, usize, char, String)> {
+        let text: String = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+        let mut cells = vec![];
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            let mut field = |rest: &mut &str| {
+                let (head, tail) = rest.split_once(',').unwrap();
+                *rest = tail;
+                head.to_string()
+            };
+            let (x, y) = (field(&mut rest).parse::<usize>().unwrap(), field(&mut rest).parse::<usize>().unwrap());
+            if runs {
+                let color = field(&mut rest);
+                let count: usize = field(&mut rest).parse().unwrap();
+                let chars: Vec<char> = rest.chars().take(count).collect();
+                rest = &rest[chars.iter().map(|c| c.len_utf8()).sum::<usize>()..];
+                rest = rest.strip_prefix(';').unwrap();
+                for (i, ch) in chars.into_iter().enumerate() { cells.push((x + i, y, ch, color.clone())); }
+            } else {
+                let mut chars = rest.chars();
+                let ch = chars.next().unwrap();
+                rest = chars.as_str().strip_prefix(',').unwrap();
+                let (color, tail) = rest.split_once(';').unwrap();
+                rest = tail;
+                cells.push((x, y, ch, color.to_string()));
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn runs_carry_the_same_cells_as_one_record_each() {
+        let mut seed = 11u32;
+        let mut next = move || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed >> 8 };
+        let chars = ['a', '"', '\\', '\u{1}', '█', ';', ',', '9', '╱', '\u{1F600}'];
+        let mut frame = vec![];
+        let (mut x, mut y) = (0usize, 0usize);
+        for i in 0..20000 {
+            // Mostly consecutive cells with repeated colours, with jumps and duplicates.
+            match next() % 10 { 0 => { y += 1; x = (next() % 40) as usize; } 1 => x += 3, 2 => {} _ => x += 1 }
+            let shade = (next() % 3) as u8;
+            frame.push(DirectCell {
+                x, y, ch: chars[(next() as usize + i) % chars.len()], color: (shade, 40, 200),
+                background: if next() % 13 == 0 { Some((shade, 1, 2)) } else { None }, attrs: 0,
+            });
+        }
+        let (mut cells, mut runs) = (String::new(), String::new());
+        super::encode_preview_cells(&frame, &mut cells);
+        super::encode_preview_runs(&frame, &mut runs);
+        assert_eq!(decode(&runs, true), decode(&cells, false));
+        assert!(runs.len() < cells.len());
+        super::encode_preview_runs(&[], &mut runs);
+        assert_eq!(runs, "");
+    }
+
+    #[test]
+    fn headless_dump_keeps_its_wire_format() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Mutex;
+        let mut screen = Screen::new_headless(6, 2, Arc::new(Mutex::new(String::new())), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+        screen.put(0, 0, 'A', "\x1b[38;2;12;34;56m".into());
+        screen.put(1, 0, '"', "\x1b[38;2;12;34;56m".into());
+        screen.put(2, 0, ' ', "\x1b[38;2;12;34;56m".into());
+        screen.put(3, 0, 'B', "invalid".into());
+        screen.put(4, 0, '\\', "\x1b[32m".into());
+        screen.put(0, 1, 'C', "\x1b[32m".into());
+        let mut expected = String::new();
+        for y in 0..screen.rows {
+            for x in 0..screen.cols {
+                let ch = screen.grid[y][x];
+                let Some((r, g, b)) = (ch != ' ').then(|| ansi_sgr_to_rgb(&screen.color[y][x])).flatten() else { continue };
+                expected.push_str(&format!("{x},{y},"));
+                json_push_escaped_char(&mut expected, ch);
+                expected.push_str(&format!(",#{r:02x}{g:02x}{b:02x};"));
+            }
+        }
+        assert_eq!(screen.dump_cells(), expected);
+        screen.preview_runs = true;
+        assert_eq!(decode(&screen.dump_cells(), true), decode(&expected, false));
+    }
+
+    // cargo test --release preview_frame_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn preview_frame_cost() {
+        use std::time::{Duration, Instant};
+        use crate::neon_scenes::{Scene, Style};
+        let loud = crate::interactive_matrix::Sound { bass: 0.6, treble: 0.5 };
+        for style in [Style::City, Style::Circuit] {
+            let mut scene = Scene::new(style);
+            let (mut frame, mut out, mut runs) = (vec![], String::new(), String::new());
+            for _ in 0..120 { scene.step(1. / 30., Some((0.4, 0.5)), loud); }
+            let (mut step, mut draw, mut encode, mut encode_runs) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let frames = 300;
+            for _ in 0..frames {
+                let t = Instant::now();
+                scene.step(1. / 30., Some((0.4, 0.5)), loud);
+                step += t.elapsed();
+                let t = Instant::now();
+                scene.draw(232, 66, 1.75, &mut frame);
+                draw += t.elapsed();
+                let t = Instant::now();
+                super::encode_preview_cells(&frame, &mut out);
+                encode += t.elapsed();
+                let t = Instant::now();
+                super::encode_preview_runs(&frame, &mut runs);
+                encode_runs += t.elapsed();
+            }
+            let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
+            eprintln!("PREVIEW {style:?} 232x66 step {:.3} draw {:.3} encode {:.3} ms ({} bytes) runs {:.3} ms ({} bytes), {} cells",
+                ms(step), ms(draw), ms(encode), out.len(), ms(encode_runs), runs.len(), frame.len());
+        }
+    }
+
     use super::*;
     #[test]
     fn diagonal_glyph_survives_preview_json_transport() {
@@ -4248,6 +4463,8 @@ fn preview_worker(
     failed: FailedQueue,
     audio: AudioState,
     ambient: bool,
+    requested_period: Duration,
+    runs: bool,
 ) {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -4261,6 +4478,7 @@ fn preview_worker(
         let mut rng=rand::rngs::StdRng::from_entropy();
         let mut rain=interactive_matrix::Rain::new(cols,rows,1.75,&mut rng);
         rain.reactive_speed=interactive_matrix::reactive_motion();
+        let mut encoded=String::new();
         let mut scene=neon_scenes::Style::parse(&fx).map(neon_scenes::Scene::new);let mut tunnel=interactive_tunnel::Tunnel::new();let mut eye=interactive_eye::Eye::new();let mut eye_response=interactive_eye::AudioResponse::default();let mut matrix_drive=interactive_matrix::Sound::default();let mut frame=vec![];let mut last=Instant::now();
         while !stop.load(Ordering::Acquire) {
             let now=Instant::now();let dt=(now-last).as_secs_f32().min(0.1);last=now;
@@ -4269,16 +4487,13 @@ fn preview_worker(
             else if fx=="matrix-reactive" {matrix_drive.follow(interactive_matrix::Sound::sample(&audio),dt);rain.step(dt,pointer.sample(),matrix_drive,&mut rng,&mut frame);}
             else if fx=="tunnel-reactive" {tunnel.step(dt,pointer.sample(),interactive_matrix::Sound::sample(&audio));tunnel.draw(cols,rows,1.75,&mut frame);}
             else {let open=eye.step(dt,pointer.sample(),&mut rng);eye.draw(cols,rows,1.75,open,level,&mut frame);}
-            let mut encoded=String::new();
-            for c in &frame {
-                use std::fmt::Write;
-                let (ch,color)=c.background.map(|b|('█',b)).unwrap_or((c.ch,c.color));
-                let _=write!(encoded,"{},{},",c.x,c.y);
-                json_push_escaped_char(&mut encoded,ch);
-                let _=write!(encoded,",#{:02x}{:02x}{:02x};",color.0,color.1,color.2);
-            }
-            *cells.lock().unwrap()=encoded;gen.fetch_add(1,Ordering::Release);
-            if let Some(rest)=Duration::from_nanos(16_666_667).checked_sub(now.elapsed()){std::thread::sleep(rest);}
+            if runs {encode_preview_runs(&frame,&mut encoded)} else {encode_preview_cells(&frame,&mut encoded)}
+            // The published string comes back as next frame's buffer.
+            std::mem::swap(&mut *cells.lock().unwrap(),&mut encoded);gen.fetch_add(1,Ordering::Release);
+            // The subscriber cannot display frames beyond its own budget.
+            // Keep at least 10 simulation ticks/s for the existing dt clamp.
+            let period = if scene.is_some() {requested_period.min(Duration::from_millis(100))} else {Duration::from_nanos(16_666_667)};
+            if let Some(rest)=period.checked_sub(now.elapsed()){std::thread::sleep(rest);}
         }
         if let Some(t)=tracker {let _=t.join();}return;
     }
@@ -4291,6 +4506,7 @@ fn preview_worker(
         use ttfx::utils::rng::Rng;
         let fps: i64 = if ambient {60} else {20};
         let mut scr = Screen::new_headless(cols, rows, cells, gen, stop.clone());
+        scr.preview_runs = runs;
         let mut next_frame=std::time::Instant::now();
         'outer: loop {
             if stop.load(Ordering::Relaxed) {
@@ -4378,6 +4594,7 @@ fn preview_worker(
         };
         let state = audio; // Ambient shares one output-monitor analyzer across preview sessions
         let mut scr = Screen::new_headless(cols, rows, cells, gen, stop.clone());
+        scr.preview_runs = runs;
         let res = match fx.as_str() {
             "donut" => fx_donut(
                 &mut scr,
@@ -4457,6 +4674,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
         budget: Duration,
         w: usize,
         h: usize,
+        runs: bool,
         join: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -4480,6 +4698,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
     });
 
     let mut sessions: HashMap<String, Session> = HashMap::new();
+    let mut held: Option<String> = None;
     let failed: FailedQueue = Arc::new(Mutex::new(Vec::new()));
     let budget = if ambient {Duration::from_nanos(16_666_667)} else {Duration::from_millis(83)};
     let stdout = std::io::stdout();
@@ -4494,7 +4713,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
     };
 
     'main: loop {
-        while let Ok(line) = rx.try_recv() {
+        while let Some(line) = held.take().or_else(|| rx.try_recv().ok()) {
             if line.is_empty() {
                 break 'main; // EOF
             }
@@ -4511,6 +4730,8 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
                     // A slow shell asks for fewer frames than it cannot paint.
                     let fps = daemon_json_num(&line, "fps", 0);
                     let budget = if fps > 0 {Duration::from_secs_f64(1.0 / fps.min(60) as f64)} else {budget};
+                    // Shells that read runs say so; everyone else keeps one record per cell.
+                    let runs = daemon_json_str(&line, "format") == "runs";
                     stop_session(&mut sessions, &fx);
                     let stop: SharedStop = Arc::new(AtomicBool::new(false));
                     let cells: SharedCells = Arc::new(Mutex::new(String::new()));
@@ -4524,7 +4745,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
                             failed.clone(),
                             audio.clone(),
                         );
-                        move || preview_worker(fx, cols, rows, cells, gen, stop, failed, audio, ambient)
+                        move || preview_worker(fx, cols, rows, cells, gen, stop, failed, audio, ambient, budget, runs)
                     });
                     sessions.insert(
                         fx.clone(),
@@ -4537,6 +4758,7 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
                             budget,
                             w: cols,
                             h: rows,
+                            runs,
                             join: Some(join),
                         },
                     );
@@ -4578,14 +4800,23 @@ fn run_preview_daemon(ambient: bool) -> Result<()> {
             sess.last_emit = std::time::Instant::now();
             use std::io::Write;
             let mut out = stdout.lock();
+            let key = if sess.runs { "runs" } else { "cells" };
             let _ = writeln!(
                 out,
-                "{{\"fx\":\"{fx}\",\"cells\":\"{cells}\",\"w\":{},\"h\":{},\"volume\":{}}}",
+                "{{\"fx\":\"{fx}\",\"{key}\":\"{cells}\",\"w\":{},\"h\":{},\"volume\":{}}}",
                 sess.w, sess.h, audio.volume()
             );
             let _ = out.flush();
         }
-        std::thread::sleep(Duration::from_millis(if ambient {2} else {40}));
+        // Wait about half a frame of the fastest subscriber, or until a command
+        // comes in. Polling every 2 ms woke the daemon 500 times a second.
+        let wait = sessions.values().map(|s| s.budget).min()
+            .map_or(Duration::from_millis(100), |b| (b / 2).max(Duration::from_millis(2)));
+        match rx.recv_timeout(wait) {
+            Ok(line) => held = Some(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'main,
+        }
     }
 
     let fxs: Vec<String> = sessions.keys().cloned().collect();

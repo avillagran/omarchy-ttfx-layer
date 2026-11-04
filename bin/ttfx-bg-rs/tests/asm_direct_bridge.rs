@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use ttfx_bg_rs::asm_direct_bridge::{decode_frame, emit_frame, DirectCell, FrameSink};
+use ttfx_bg_rs::asm_direct_bridge::{decode_frame, decode_frame_with, emit_frame, DirectCell, FrameSink, HandleMemo};
 
 #[path = "../src/frame_handoff.rs"]
 mod frame_handoff;
@@ -478,4 +478,36 @@ fn panicking_color_transform_stops_without_unwinding_through_c() {
     assert_eq!(result, 1);
     assert_eq!(context.error, Some("assembly frame callback panicked"));
     assert_eq!(context.generation.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn handle_memo_decodes_like_a_fresh_decode_and_forgets_each_frame() {
+    // 600 visuals: more than the memo's slots, so handles collide.
+    let mut pool = vec![0u8; 32 + 600 * 40 + 256];
+    let mut handles = Vec::new();
+    for i in 0..600usize {
+        let ch = ['a', 'Z', ' ', '界', '█'][i % 5];
+        let bg = if i % 7 == 0 { 0x102030 } else { u64::MAX };
+        handles.push(visual(&mut pool, 64 + i * 40, ch, (i as u64) * 0x010203, bg, [0, 1, 4, 64, 2][i % 5]));
+    }
+    let mut memo = HandleMemo::default();
+    let (cols, rows) = (50u64, 40u64);
+    let mut seed = 7u64;
+    for frame in 0..6 {
+        let grid: Vec<u32> = (0..cols * rows).map(|_| {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            if seed % 4 == 0 { 0 } else { handles[(seed % if frame % 2 == 0 { 600 } else { 9 }) as usize] }
+        }).collect();
+        let (mut fresh, mut memoized) = (Vec::new(), Vec::new());
+        unsafe {
+            decode_frame(cols, rows, grid.as_ptr(), pool.as_ptr(), &mut fresh).unwrap();
+            decode_frame_with(cols, rows, grid.as_ptr(), pool.as_ptr(), &mut memoized, &mut memo).unwrap();
+        }
+        assert_eq!(fresh, memoized, "frame {frame}");
+        // The next frame's pool reuses offsets for other visuals.
+        for (i, &handle) in handles.iter().enumerate() {
+            let offset = (handle & 0xff_ffff) as usize;
+            visual(&mut pool, offset, ['q', 'R', ' ', 'あ', '▒'][(i + frame + 1) % 5], (i as u64 + frame as u64) * 0x030201, u64::MAX, 0);
+        }
+    }
 }

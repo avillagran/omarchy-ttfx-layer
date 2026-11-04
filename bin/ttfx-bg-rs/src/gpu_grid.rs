@@ -61,7 +61,21 @@ pub struct GpuGrid {
     bg: Vec<u8>,
     prev_fg: Vec<u8>,
     prev_bg: Vec<u8>,
+    /// Each cell a plane pair may hold nonzero bytes in, with its damage
+    /// tile: everything else is zero. A frame writes a fraction of the grid,
+    /// so the diff visits only these instead of the whole grid.
+    written: Vec<(u32, u32)>,
+    prev_written: Vec<(u32, u32)>,
+    /// The last damage made `prev` equal to the current planes, but the
+    /// swap that makes it so waits for the next fill instead of a copy.
+    prev_pending: bool,
     force_full: bool,
+    /// Rows of the fg and bg planes changed since the cell textures were last
+    /// uploaded, as `[first, end)` spans; `None` uploads both planes whole.
+    upload_rows: Option<[(usize, usize); 2]>,
+    /// A fill that `damage_tiles` has not compared yet: its changed rows are
+    /// unknown, so the next upload sends everything.
+    unsynced: bool,
     slot_cache: Option<crate::glyph_slot_cache::SlotCache>,
 }
 
@@ -72,6 +86,23 @@ pub struct GpuGrid {
 /// a few larger rectangles keep its partial repaint working.
 pub fn coalesce_rects(rects: &mut Vec<[i32; 4]>, max: usize) {
     let max = max.max(1);
+    // The pairwise search is cubic: hundreds of damaged tiles (a dense scene
+    // on a large grid) would cost tens of milliseconds per frame. Fold them
+    // first into the cells of a coarse grid over their bounding box; the
+    // result still covers every damaged pixel.
+    if rects.len() > COALESCE_EXACT_LIMIT && max < COALESCE_BUCKETS * COALESCE_BUCKETS {
+        let bounds = rects.iter().copied().reduce(rect_union).unwrap();
+        let cell = |origin: i32, size: i32, at: i32| {
+            (((at - origin) as i64 * COALESCE_BUCKETS as i64) / (size.max(1) as i64)).clamp(0, COALESCE_BUCKETS as i64 - 1) as usize
+        };
+        let mut buckets = [None::<[i32; 4]>; COALESCE_BUCKETS * COALESCE_BUCKETS];
+        for r in rects.iter().copied() {
+            let index = cell(bounds[1], bounds[3], r[1] + r[3] / 2) * COALESCE_BUCKETS + cell(bounds[0], bounds[2], r[0] + r[2] / 2);
+            buckets[index] = Some(buckets[index].map_or(r, |b| rect_union(b, r)));
+        }
+        rects.clear();
+        rects.extend(buckets.into_iter().flatten());
+    }
     while rects.len() > max {
         let mut best = (i64::MAX, 0, 1);
         for i in 0..rects.len() {
@@ -89,8 +120,25 @@ pub fn coalesce_rects(rects: &mut Vec<[i32; 4]>, max: usize) {
     }
 }
 
+/// Up to this many rectangles are merged by the exact pairwise search.
+const COALESCE_EXACT_LIMIT: usize = 32;
+/// Larger sets are first folded into this many cells per axis.
+const COALESCE_BUCKETS: usize = 4;
+
+/// An empty `[first, end)` row span; `join_rows` with it is the identity.
+const NO_ROWS: (usize, usize) = (usize::MAX, 0);
+
+fn join_rows(a: (usize, usize), b: (usize, usize)) -> (usize, usize) {
+    (a.0.min(b.0), a.1.max(b.1))
+}
+
 pub fn rect_area(r: [i32; 4]) -> i64 {
     r[2] as i64 * r[3] as i64
+}
+
+/// The four bytes of one cell in a plane, as one load.
+fn word(plane: &[u8], i: usize) -> u32 {
+    u32::from_ne_bytes(plane[i..i + 4].try_into().unwrap())
 }
 
 fn rect_union(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
@@ -127,7 +175,12 @@ impl GpuGrid {
             bg: vec![0; cols.max(1) * rows.max(1) * 4],
             prev_fg: Vec::new(),
             prev_bg: Vec::new(),
+            written: Vec::new(),
+            prev_written: Vec::new(),
+            prev_pending: false,
             force_full: true,
+            upload_rows: None,
+            unsynced: true,
             slot_cache: profile.cached().then(crate::glyph_slot_cache::SlotCache::new),
         }
     }
@@ -158,6 +211,11 @@ impl GpuGrid {
         self.damage_tiles().map(|tiles| self.tiles_to_rects(&tiles))
     }
 
+    /// Foreground and background planes as the next upload would send them.
+    #[cfg(test)]
+    pub fn cell_planes(&self) -> (&[u8], &[u8]) {
+        (&self.fg, &self.bg)
+    }
     /// Changed tiles (TILE_W x TILE_H cells, row-major) since the previous
     /// call; `None` means the whole surface. Glyphs never leave their cell,
     /// so cell bounds are exact.
@@ -168,29 +226,70 @@ impl GpuGrid {
         let (cols, rows) = (self.cols, self.rows);
         let (tx, ty) = (cols.div_ceil(TILE_W), rows.div_ceil(TILE_H));
         let mut tiles = vec![false; tx * ty];
-        if !full {
-            let row_bytes = cols * 4;
-            for y in 0..rows {
-                let span = y * row_bytes..(y + 1) * row_bytes;
-                // Most rows are unchanged: one memcmp each settles them.
-                if self.fg[span.clone()] == self.prev_fg[span.clone()]
-                    && self.bg[span.clone()] == self.prev_bg[span.clone()]
-                {
-                    continue;
-                }
-                for t in 0..tx {
-                    let a = span.start + t * TILE_W * 4;
-                    let b = span.start + ((t + 1) * TILE_W).min(cols) * 4;
-                    if self.fg[a..b] != self.prev_fg[a..b] || self.bg[a..b] != self.prev_bg[a..b] {
-                        tiles[(y / TILE_H) * tx + t] = true;
+        self.force_full = false;
+        self.unsynced = false;
+        if full {
+            self.prev_fg.clone_from(&self.fg);
+            self.prev_bg.clone_from(&self.bg);
+            self.prev_written.clone_from(&self.written);
+            self.prev_pending = false;
+            self.upload_rows = None;
+            return None;
+        }
+        if self.prev_pending {
+            // No fill since the last damage: nothing changed.
+            return Some(tiles);
+        }
+        // A cell zero in both frames is equal in both, so only cells either
+        // frame wrote can differ.
+        let mut changed = [NO_ROWS; 2];
+        for &(cell, tile) in self.written.iter().chain(&self.prev_written) {
+            let (i, tile) = (cell as usize * 4, tile as usize);
+            let fg = word(&self.fg, i) != word(&self.prev_fg, i);
+            let bg = word(&self.bg, i) != word(&self.prev_bg, i);
+            if fg || bg {
+                tiles[tile] = true;
+                let row = cell as usize / cols;
+                for (rows, differs) in changed.iter_mut().zip([fg, bg]) {
+                    if differs {
+                        *rows = join_rows(*rows, (row, row + 1));
                     }
                 }
             }
         }
-        self.prev_fg.clone_from(&self.fg);
-        self.prev_bg.clone_from(&self.bg);
-        self.force_full = false;
-        (!full).then_some(tiles)
+        // Rows not yet uploaded accumulate until the next draw sends them.
+        self.upload_rows = self.upload_rows.map(|[fg, bg]| [join_rows(fg, changed[0]), join_rows(bg, changed[1])]);
+        self.prev_pending = true;
+        Some(tiles)
+    }
+
+    /// The whole-grid diff and copy the cell lists replace.
+    #[cfg(test)]
+    pub(crate) fn damage_tiles_reference(
+        cols: usize,
+        rows: usize,
+        planes: (&[u8], &[u8]),
+        prev: (&[u8], &[u8]),
+    ) -> Vec<bool> {
+        let (fg, bg) = planes;
+        let (prev_fg, prev_bg) = prev;
+        let (tx, ty) = (cols.div_ceil(TILE_W), rows.div_ceil(TILE_H));
+        let mut tiles = vec![false; tx * ty];
+        let row_bytes = cols * 4;
+        for y in 0..rows {
+            let span = y * row_bytes..(y + 1) * row_bytes;
+            if fg[span.clone()] == prev_fg[span.clone()] && bg[span.clone()] == prev_bg[span.clone()] {
+                continue;
+            }
+            for t in 0..tx {
+                let a = span.start + t * TILE_W * 4;
+                let b = span.start + ((t + 1) * TILE_W).min(cols) * 4;
+                if fg[a..b] != prev_fg[a..b] || bg[a..b] != prev_bg[a..b] {
+                    tiles[(y / TILE_H) * tx + t] = true;
+                }
+            }
+        }
+        tiles
     }
 
     /// Merge tiles into few rectangles: horizontal runs per tile row, then
@@ -257,6 +356,14 @@ impl GpuGrid {
 
     /// Rebuild both cell textures from a sparse frame.
     pub fn fill(&mut self, cells: &[DirectCell]) -> Result<()> {
+        if self.prev_pending {
+            // The planes just diffed become the previous frame; the older
+            // pair is cleared and rewritten.
+            std::mem::swap(&mut self.fg, &mut self.prev_fg);
+            std::mem::swap(&mut self.bg, &mut self.prev_bg);
+            std::mem::swap(&mut self.written, &mut self.prev_written);
+            self.prev_pending = false;
+        }
         if self.fill_once(cells)? {
             return Ok(());
         }
@@ -270,13 +377,20 @@ impl GpuGrid {
     }
 
     fn fill_once(&mut self, cells: &[DirectCell]) -> Result<bool> {
+        self.unsynced = true;
+        // A full clear streams faster than visiting the written cells.
         self.fg.fill(0);
         self.bg.fill(0);
+        self.written.clear();
+        let tiles_wide = self.cols.div_ceil(TILE_W);
         for cell in cells {
             if cell.x >= self.cols || cell.y >= self.rows {
                 continue;
             }
-            let i = (cell.y * self.cols + cell.x) * 4;
+            let index = cell.y * self.cols + cell.x;
+            let tile = (cell.y / TILE_H) * tiles_wide + cell.x / TILE_W;
+            self.written.push((index as u32, tile as u32));
+            let i = index * 4;
             let mut flags = 0u8;
             if let Some((r, g, b)) = cell.background {
                 self.bg[i..i + 3].copy_from_slice(&[r, g, b]);
@@ -641,21 +755,34 @@ impl GpuPipeline {
             let sent=self.cell_upload_cache.as_ref()
                 .map(|cache|cache.plan((cols,rows),&grid.fg,&grid.bg,resized||atlas_was_reset))
                 .unwrap_or([true,true]);
+            // Only the rows that changed since the last upload: the texture
+            // already holds every other row (an effect without backgrounds
+            // never sends its bg plane again).
+            let spans = match grid.upload_rows {
+                Some(spans) if !resized && !grid.unsynced && self.cell_upload_cache.is_none() => spans,
+                _ => [(0, rows as usize); 2],
+            };
+            let row_bytes = cols as usize * 4;
             for (index,(tex, data)) in [(self.fg_tex, &grid.fg), (self.bg_tex, &grid.bg)].into_iter().enumerate() {
-                if !sent[index] {continue;}
-                self.last_cell_upload_bytes[index]=data.len();
+                let (first, end) = spans[index];
+                if !sent[index] || first >= end {continue;}
+                let bytes = &data[first * row_bytes..end * row_bytes];
+                self.last_cell_upload_bytes[index]=bytes.len();
                 gl::BindTexture(gl::TEXTURE_2D, tex);
                 if resized {
                     gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA8 as i32, cols, rows, 0,
-                        gl::RGBA, gl::UNSIGNED_BYTE, data.as_ptr() as *const c_void);
+                        gl::RGBA, gl::UNSIGNED_BYTE, bytes.as_ptr() as *const c_void);
                 } else {
-                    gl::TexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, cols, rows,
-                        gl::RGBA, gl::UNSIGNED_BYTE, data.as_ptr() as *const c_void);
+                    gl::TexSubImage2D(gl::TEXTURE_2D, 0, 0, first as i32, cols, (end - first) as i32,
+                        gl::RGBA, gl::UNSIGNED_BYTE, bytes.as_ptr() as *const c_void);
                 }
             }
             if let Some(cache)=self.cell_upload_cache.as_mut() {
                 cache.commit((cols,rows),&grid.fg,&grid.bg,sent);
             }
+            // The textures now hold this fill. If damage_tiles has not seen it,
+            // its snapshot is older than the textures: send everything next time.
+            grid.upload_rows = (!grid.unsynced).then_some([NO_ROWS; 2]);
             self.grid = (cols, rows);
         }
         if let Some(axis)=self.axis.as_mut(){axis.ensure(grid.width,grid.height,cols,rows);}
@@ -734,8 +861,64 @@ mod tests {
         grid.prev_bg = vec![0; 40 * 20 * 4];
         for &(x, y) in cells {
             grid.fg[(y * 40 + x) * 4] = 255;
+            grid.written.push(((y * 40 + x) as u32, ((y / TILE_H) * 5 + x / TILE_W) as u32));
         }
         grid
+    }
+
+    #[test]
+    fn swapped_planes_and_listed_cells_diff_like_the_whole_grid() {
+        let (cols, rows) = (61, 23);
+        let profile = crate::render_profile::RenderProfile::Reference;
+        let (mut a, mut b) = (GpuGrid::with_profile(cols, rows, 8., profile), GpuGrid::with_profile(cols, rows, 8., profile));
+        a.set_size(244, 184, 1.);
+        b.set_size(244, 184, 1.);
+        let mut seed = 0x1234_5678u32;
+        let mut next = move |n: u32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) % n
+        };
+        // What the planes were at the last damage, as the old copy kept them.
+        let mut prev: Option<(Vec<u8>, Vec<u8>)> = None;
+        for step in 0..3000 {
+            if next(30) == 0 {
+                // A resize damages everything.
+                let size = [(244, 184), (250, 190)][next(2) as usize];
+                a.set_size(size.0, size.1, 1.);
+                b.set_size(size.0, size.1, 1.);
+            }
+            // Some steps skip the fill (damage twice in a row) or the
+            // damage (fill twice in a row).
+            if next(7) != 0 {
+                let count = [0, 1, 5, 40, 300, cols * rows][next(6) as usize];
+                let cells: Vec<DirectCell> = (0..count)
+                    .map(|_| DirectCell {
+                        x: next(cols as u32 + 2) as usize,
+                        y: next(rows as u32 + 1) as usize,
+                        ch: [' ', ' ', 'A', '·', '█'][next(5) as usize],
+                        color: (next(3) as u8 * 100, next(2) as u8, 7),
+                        background: (next(4) == 0).then_some((1, next(2) as u8, 3)),
+                        attrs: [0, 0, 1, 4][next(4) as usize],
+                    })
+                    .collect();
+                a.fill(&cells).unwrap();
+                // A grid that never swaps in its older planes.
+                b.prev_pending = false;
+                b.fill(&cells).unwrap();
+                assert!(a.fg == b.fg && a.bg == b.bg, "step {step}");
+            }
+            if next(4) != 0 {
+                let full = a.force_full || prev.is_none();
+                let want = if full {
+                    None
+                } else {
+                    let (pf, pb) = prev.as_ref().unwrap();
+                    Some(GpuGrid::damage_tiles_reference(cols, rows, (&a.fg, &a.bg), (pf, pb)))
+                };
+                assert_eq!(a.damage_tiles(), want, "step {step}");
+                prev = Some((a.fg.clone(), a.bg.clone()));
+            }
+        }
     }
 
     #[test]
@@ -762,6 +945,43 @@ mod tests {
     fn stacked_tiles_merge_into_one_rectangle() {
         let mut grid = grid_with(&[(0, 0), (9, 0), (0, 5), (9, 5)]);
         assert_eq!(grid.damage(), Some(vec![[0, 0, 160, 80]]));
+    }
+
+    #[test]
+    fn damage_follows_every_fill_and_repeat_calls_without_copying_planes() {
+        // Glyph-free cells (blank or hidden) so no font is needed.
+        let frame = |k: usize| -> Vec<DirectCell> {
+            (0..120).map(|i| DirectCell {
+                x: (i * 13 + k * 7) % 40, y: (i * 5 + k) % 20, ch: ' ',
+                color: ((i * k) as u8, 2, 3),
+                background: if (i + k) % 3 == 0 { Some((k as u8, 9, 9)) } else { None },
+                attrs: if i % 4 == 0 { HIDDEN } else { 0 },
+            }).collect()
+        };
+        let mut grid = GpuGrid::new(40, 20, 8.0);
+        grid.set_size(400, 200, 1.0);
+        let mut snapshot: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut seed = 0x51u64;
+        for step in 0..400 {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            if seed % 3 != 0 {
+                grid.fill(&frame((seed >> 8) as usize % 5)).unwrap();
+                continue;
+            }
+            let tiles = grid.damage_tiles();
+            match snapshot.replace((grid.fg.clone(), grid.bg.clone())) {
+                None => assert_eq!(tiles, None, "step {step}"),
+                Some((fg, bg)) => {
+                    let mut want = vec![false; 5 * 5];
+                    for i in 0..40 * 20 {
+                        if fg[i * 4..i * 4 + 4] != grid.fg[i * 4..i * 4 + 4] || bg[i * 4..i * 4 + 4] != grid.bg[i * 4..i * 4 + 4] {
+                            want[(i / 40 / TILE_H) * 5 + (i % 40) / TILE_W] = true;
+                        }
+                    }
+                    assert_eq!(tiles, Some(want), "step {step}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -809,6 +1029,20 @@ mod coalesce_tests {
         let mut rects = original.clone();
         coalesce_rects(&mut rects, 3);
         assert_eq!(rects.len(), 3);
+        for r in &original {
+            assert!(rects.iter().any(|m| contains(*m, *r)), "{r:?} uncovered");
+        }
+    }
+
+    #[test]
+    fn hundreds_of_tiles_merge_quickly_and_stay_covered() {
+        // A dense scene on a 936x279 grid damages about 500 tiles a frame.
+        let original: Vec<[i32; 4]> = (0..600).map(|i| [(i * 97) % 3400, (i * 61) % 2200, 30, 32]).collect();
+        let mut rects = original.clone();
+        let start = std::time::Instant::now();
+        coalesce_rects(&mut rects, 2);
+        assert!(start.elapsed() < std::time::Duration::from_millis(5), "{:?}", start.elapsed());
+        assert_eq!(rects.len(), 2);
         for r in &original {
             assert!(rects.iter().any(|m| contains(*m, *r)), "{r:?} uncovered");
         }

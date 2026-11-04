@@ -2090,6 +2090,12 @@ struct SandClock {
     field_figure: usize,
     time_key: u32,
     rng: Rng,
+    /// Tests turn every shortcut off to compare the clock with itself.
+    #[cfg(test)]
+    exhaustive: bool,
+    /// Tests replay a fixed wall clock.
+    #[cfg(test)]
+    fake_hms: Option<(u32, u32, u32)>,
 }
 impl SandClock {
     fn new(backdrop: SandBackdrop) -> Self {
@@ -2101,6 +2107,10 @@ impl SandClock {
             field: vec![],
             field_figure: usize::MAX,
             time_key: u32::MAX,
+            #[cfg(test)]
+            exhaustive: false,
+            #[cfg(test)]
+            fake_hms: None,
             grains: vec![],
             shown: vec![],
             font: SandFont::default(),
@@ -2159,6 +2169,9 @@ impl SandClock {
         aspect: f32,
     ) {
         self.time += dt;
+        #[cfg(test)]
+        let (h, m, s) = self.fake_hms.unwrap_or_else(local_hms);
+        #[cfg(not(test))]
         let (h, m, s) = local_hms();
         let key = h * 3600 + m * 60 + s;
         let resized = self.cols != cols || self.rows != rows;
@@ -2256,6 +2269,19 @@ impl SandClock {
     }
     fn draw(&self, r: &mut Raster, sound: &Sound) {
         self.draw_backdrop(r, sound);
+        self.draw_grains(r, sound);
+    }
+    /// Whether work whose result is already known may be skipped.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn shortcuts(&self) -> bool {
+        true
+    }
+    #[cfg(test)]
+    fn shortcuts(&self) -> bool {
+        !self.exhaustive
+    }
+    fn draw_grains(&self, r: &mut Raster, sound: &Sound) {
         // The digits tremble on the bass, keeping their shape.
         let reach = music_reach(self.rows);
         let tremble = sound.bass * 0.9 * reach;
@@ -2272,8 +2298,15 @@ impl SandClock {
             let glint = (self.time * (1.2 + g.speed * 1.6) + g.phase).sin().max(0.).powi(6);
             let sparkle = glint * (0.7 + sound.treble * 0.9);
             let light = g.shade * (1.05 + sound.treble * 0.3 + sound.bass * 0.25) + sparkle * 0.6;
-            let x = (g.x + (self.time * 41. + g.phase).sin() * tremble).round() as i32;
-            let y = (g.y + (self.time * 37. + g.phase * 2.).sin() * tremble * 0.5).round() as i32;
+            // Without bass the offsets are zero: skip their sines.
+            let (x, y) = if tremble == 0. && self.shortcuts() {
+                (g.x.round() as i32, g.y.round() as i32)
+            } else {
+                (
+                    (g.x + (self.time * 41. + g.phase).sin() * tremble).round() as i32,
+                    (g.y + (self.time * 37. + g.phase * 2.).sin() * tremble * 0.5).round() as i32,
+                )
+            };
             let colour = mix((255, 205, 120), (255, 250, 232), sparkle + sound.bass * 0.3);
             r.dot(x, y, 2. - g.size * 0.5, ch, scale(colour, light));
             if g.size > 0.8 {
@@ -2322,6 +2355,8 @@ const CHLADNI_MODES: [(f32, f32); 8] = [
 fn chladni(u: f32, v: f32, (n, m): (f32, f32)) -> f32 {
     (n * PI * u).cos() * (m * PI * v).cos() - (m * PI * u).cos() * (n * PI * v).cos()
 }
+/// Depths below a crest that can still hold a lit grain.
+const DUNE_LIT: usize = 13;
 fn dune_ridge(layer: usize, x: f32, time: f32, rows: usize) -> f32 {
     let (base, drift) = ([0.72, 0.82, 0.92][layer], [1.5, 3., 5.][layer]);
     let w = x + time * drift + layer as f32 * 70.;
@@ -2444,6 +2479,7 @@ impl SandClock {
             SandBackdrop::Galaxy => {
                 let (cx, cy) = (w * 0.5, h * 0.5);
                 let settle = (-dt * 0.8).exp();
+                let still = sound.bass == 0. && self.shortcuts();
                 for g in &mut self.back {
                     g.b += dt * (0.05 + 0.5 / (1. + g.a * 0.09 / reach)) * (1. + sound.bass * 1.2);
                     g.x = (g.x + g.vx * dt) * settle;
@@ -2451,7 +2487,12 @@ impl SandClock {
                     g.vx *= friction;
                     g.vy *= friction;
                     // The bass travels outward through the arms as a ring.
-                    let ring = 1. + sound.bass * 0.24 * (g.a * 0.12 / reach - time * 3.).sin().max(0.);
+                    // Silence leaves the ring at rest: skip its sine.
+                    let ring = if still {
+                        1.
+                    } else {
+                        1. + sound.bass * 0.24 * (g.a * 0.12 / reach - time * 3.).sin().max(0.)
+                    };
                     let r = g.a * ring;
                     g.sx = cx + r * g.b.cos() * aspect + g.x;
                     g.sy = cy + r * g.b.sin() * 0.72 + g.y;
@@ -2459,45 +2500,102 @@ impl SandClock {
             }
         }
     }
-    fn draw_backdrop(&self, r: &mut Raster, sound: &Sound) {
-        let (cols, rows) = (self.cols, self.rows);
-        let time = self.time;
-        if self.backdrop == SandBackdrop::Dunes {
+    /// The three dunes, each cell written once. Each later layer used to
+    /// paint over the one before it, dark body included; now only the lit
+    /// grains near a crest are sent, by the frontmost dune that reaches them.
+    /// The dark body was blank black cells: the same pixels as no cell, and
+    /// everything drawn after them sits in front anyway.
+    fn draw_dunes(&self, r: &mut Raster, sound: &Sound) {
+        const TINTS: [Color; 3] = [(80, 72, 185), (118, 88, 215), (165, 108, 240)];
+        let (cols, rows, time) = (self.cols, self.rows, self.time);
+        let light = 0.62 + sound.treble * 0.3;
+        // Chance and colour depend only on the depth below the crest; past a
+        // dozen cells the chance is spent and only the dark body remains.
+        let chance = |depth: f32| if depth < 2. { 0.9 } else { 0.42 - depth * 0.035 };
+        debug_assert!(chance(DUNE_LIT as f32) <= 0.);
+        let odds: [f32; DUNE_LIT] = std::array::from_fn(|d| chance(d as f32));
+        let lit: [[Color; DUNE_LIT]; 3] = std::array::from_fn(|layer| {
+            std::array::from_fn(|depth| {
+                let k = (1.5 - depth as f32 * 0.09).max(0.45);
+                scale(TINTS[layer], light * k)
+            })
+        });
+        // Grains sit on even columns only.
+        for x in (0..cols).step_by(2) {
+            let tops = [0, 1, 2].map(|layer| dune_ridge(layer, x as f32, time, rows) as usize);
+            let column = (x as u32).wrapping_mul(7349);
             for layer in 0..3 {
-                let tint = [(80, 72, 185), (118, 88, 215), (165, 108, 240)][layer];
-                let light = 0.62 + sound.treble * 0.3;
-                for x in 0..cols {
-                    let top = dune_ridge(layer, x as f32, time, rows) as usize;
-                    for y in top..rows {
-                        let seed = (x as u32).wrapping_mul(7349) ^ (y as u32).wrapping_mul(9151);
-                        let depth = (y - top) as f32;
-                        // A bright crest fading down, solid enough to hide the
-                        // dune behind it so each ridge reads as a silhouette.
-                        let chance = if depth < 2. {
-                            0.9
-                        } else {
-                            0.42 - depth * 0.035
-                        };
-                        let grain = x % 2 == 0 && variant(seed) < chance;
-                        let z = 9. - layer as f32;
-                        if grain {
-                            let k = (1.5 - depth * 0.09).max(0.45);
-                            r.dot(x as i32, y as i32, z, '·', scale(tint, light * k));
-                        } else {
-                            r.dot(x as i32, y as i32, z, ' ', (0, 0, 0));
-                        }
+                // Where a dune in front begins, this one is hidden.
+                let hidden = tops[layer + 1..].iter().copied().min().unwrap_or(rows);
+                let end = (tops[layer] + DUNE_LIT).min(hidden).min(rows);
+                let z = 9. - layer as f32;
+                for y in tops[layer]..end {
+                    let depth = y - tops[layer];
+                    // A bright crest fading down, solid enough to hide the
+                    // dune behind it so each ridge reads as a silhouette.
+                    if variant(column ^ (y as u32).wrapping_mul(9151)) < odds[depth] {
+                        r.dot(x as i32, y as i32, z, '·', lit[layer][depth]);
                     }
                 }
             }
         }
+    }
+    /// The dunes as first written, layer over layer.
+    #[cfg(test)]
+    fn draw_dunes_reference(&self, r: &mut Raster, sound: &Sound) {
+        let (cols, rows) = (self.cols, self.rows);
+        let time = self.time;
+        for layer in 0..3 {
+            let tint = [(80, 72, 185), (118, 88, 215), (165, 108, 240)][layer];
+            let light = 0.62 + sound.treble * 0.3;
+            for x in 0..cols {
+                let top = dune_ridge(layer, x as f32, time, rows) as usize;
+                for y in top..rows {
+                    let seed = (x as u32).wrapping_mul(7349) ^ (y as u32).wrapping_mul(9151);
+                    let depth = (y - top) as f32;
+                    // A bright crest fading down, solid enough to hide the
+                    // dune behind it so each ridge reads as a silhouette.
+                    let chance = if depth < 2. {
+                        0.9
+                    } else {
+                        0.42 - depth * 0.035
+                    };
+                    let grain = x % 2 == 0 && variant(seed) < chance;
+                    let z = 9. - layer as f32;
+                    if grain {
+                        let k = (1.5 - depth * 0.09).max(0.45);
+                        r.dot(x as i32, y as i32, z, '·', scale(tint, light * k));
+                    } else {
+                        r.dot(x as i32, y as i32, z, ' ', (0, 0, 0));
+                    }
+                }
+            }
+        }
+    }
+    fn draw_backdrop(&self, r: &mut Raster, sound: &Sound) {
+        if self.backdrop == SandBackdrop::Dunes {
+            #[cfg(test)]
+            if self.exhaustive {
+                self.draw_dunes_reference(r, sound);
+                self.draw_back_grains(r, sound);
+                return;
+            }
+            self.draw_dunes(r, sound);
+        }
+        self.draw_back_grains(r, sound);
+    }
+    fn draw_back_grains(&self, r: &mut Raster, sound: &Sound) {
+        let time = self.time;
         let (base, glow) = match self.backdrop {
             SandBackdrop::Chladni => ((70, 170, 235), (170, 235, 255)),
             SandBackdrop::Dunes => ((170, 150, 235), (225, 210, 255)),
             _ => ((150, 90, 255), (255, 120, 205)),
         };
+        let galaxy = self.backdrop == SandBackdrop::Galaxy;
+        let calm = mix(base, glow, sound.treble * 0.6);
         for (i, g) in self.back.iter().enumerate() {
-            let twinkle = (time * 3. + i as f32).sin() > 0.97 - sound.treble * 0.2;
-            let ch = if self.backdrop == SandBackdrop::Galaxy && twinkle {
+            // Only the galaxy twinkles.
+            let ch = if galaxy && (time * 3. + i as f32).sin() > 0.97 - sound.treble * 0.2 {
                 '+'
             } else if g.size > 1.25 {
                 '•'
@@ -2505,10 +2603,10 @@ impl SandClock {
                 '·'
             };
             let light = (0.5 + g.shade * 0.35 + sound.treble * 0.25 + sound.bass * 0.12).min(1.);
-            let tone = if self.backdrop == SandBackdrop::Galaxy {
+            let tone = if galaxy {
                 mix(base, glow, g.a / (self.rows as f32 * 0.72))
             } else {
-                mix(base, glow, sound.treble * 0.6)
+                calm
             };
             r.dot(
                 g.sx.round() as i32,
@@ -2614,6 +2712,12 @@ impl Showcase {
             _ => Raster::new(cols, rows),
         };
         let r = slot.insert(r);
+        self.paint(r, cols, rows, aspect);
+        // Blank black cells only hid what was behind them; on screen they
+        // are the same pixels as no cell, so they are not sent.
+        r.recycle_visible(out);
+    }
+    fn paint(&self, r: &mut Raster, cols: usize, rows: usize, aspect: f32) {
         match self.kind {
             Kind::Terminal => {
                 self.terminal
@@ -2652,7 +2756,6 @@ impl Showcase {
                 self.sand_clock.as_ref().unwrap().draw(r, &self.sound)
             }
         }
-        r.recycle(out);
     }
 }
 #[cfg(test)]
@@ -2870,6 +2973,153 @@ mod tests {
                 ms(step),
                 ms(draw),
                 frame.len()
+            );
+        }
+    }
+    #[test]
+    fn unsent_black_blanks_leave_every_showcase_pixel_the_same() {
+        use crate::gpu_grid::GpuGrid;
+        let (cols, rows, aspect) = (312, 93, 2.17);
+        let grid = || {
+            let mut g = GpuGrid::with_profile(cols, rows, 8., crate::render_profile::RenderProfile::Reference);
+            g.set_size(cols as i32 * 4, rows as i32 * 8, 1.);
+            g
+        };
+        let mut dropped = 0;
+        for name in Kind::ALL {
+            let mut s = Showcase::new(Kind::parse(name).unwrap());
+            let (mut sent, mut all) = (vec![], vec![]);
+            s.draw(cols, rows, aspect, &mut sent);
+            let (mut a, mut b) = (grid(), grid());
+            for frame in 0..120 {
+                let f = frame as f32;
+                let level = if frame % 60 < 30 { 0. } else { 0.7 };
+                s.step(1. / 30., Some((0.5 + (f * 0.1).sin() * 0.4, 0.6)), Sound { bass: level, treble: level * 0.5 });
+                s.draw(cols, rows, aspect, &mut sent);
+                // Every cell painted, blanks included.
+                let mut r = Raster::new(cols, rows);
+                s.paint(&mut r, cols, rows, aspect.clamp(1., 4.));
+                r.recycle(&mut all);
+                a.fill(&sent).unwrap();
+                b.fill(&all).unwrap();
+                assert!(a.cell_planes() == b.cell_planes(), "{name}");
+                let before = all.len();
+                all.retain(|c| !(c.ch == ' ' && c.color == (0, 0, 0)));
+                dropped += before - all.len();
+                assert_eq!(sent, all, "{name}");
+            }
+        }
+        assert!(dropped > 0);
+    }
+    /// A clock with a fixed seed, stepped through `frames` frames of varied
+    /// sound, cursor and frame time, calling `each` after every step.
+    fn replay_clock(backdrop: SandBackdrop, cols: usize, rows: usize, frames: usize, mut each: impl FnMut(&SandClock, &Sound)) {
+        let mut c = SandClock::new(backdrop);
+        c.rng = Rng(0x5eed_1234);
+        let mut wall = 23. * 3600. + 59. * 60. + 50.;
+        for frame in 0..frames {
+            let f = frame as f32;
+            // Silence, then music, then silence again.
+            let level = if (frame / 150) % 2 == 1 { 0.5 + (f * 0.13).sin() * 0.45 } else { 0. };
+            let sound = Sound { bass: level, treble: level * (0.5 + (f * 0.07).cos() * 0.5) };
+            let pointer = (frame % 97 < 40).then(|| (0.5 + (f * 0.05).sin() * 0.4, 0.5 + (f * 0.031).cos() * 0.4));
+            let dt = [0.01, 0.0083, 0.016, 0.033][frame % 4];
+            // Fast enough to pour new digits, past midnight included.
+            wall = (wall + dt as f64 * 40.) % 86400.;
+            let t = wall as u32;
+            c.fake_hms = Some((t / 3600, t / 60 % 60, t % 60));
+            c.step(dt, &sound, pointer, cols, rows, 2.17);
+            each(&c, &sound);
+        }
+    }
+    #[test]
+    fn single_pass_dunes_paint_the_grains_the_layers_did() {
+        for (cols, rows) in [(936, 279), (174, 50), (61, 23)] {
+            let (mut fast, mut slow) = (Raster::new(cols, rows), Raster::new(cols, rows));
+            let (mut a, mut b) = (vec![], vec![]);
+            replay_clock(SandBackdrop::Dunes, cols, rows, 400, |c, sound| {
+                c.draw_dunes(&mut fast, sound);
+                c.draw_dunes_reference(&mut slow, sound);
+                fast.recycle(&mut a);
+                slow.recycle(&mut b);
+                // The same cells, less the blank dark body.
+                b.retain(|cell| cell.ch != ' ');
+                assert_eq!(a, b);
+                assert!(!a.is_empty());
+            });
+        }
+    }
+    #[test]
+    fn clock_shortcuts_render_the_same_pixels() {
+        use crate::gpu_grid::GpuGrid;
+        let (cols, rows) = (936, 279);
+        let grid = || {
+            let mut g = GpuGrid::with_profile(cols, rows, 8., crate::render_profile::RenderProfile::Reference);
+            g.set_size(cols as i32 * 4, rows as i32 * 8, 1.);
+            g
+        };
+        for backdrop in [SandBackdrop::None, SandBackdrop::Chladni, SandBackdrop::Dunes, SandBackdrop::Galaxy] {
+            // The same clock twice: one takes every shortcut, one none.
+            let mut slow = SandClock::new(backdrop);
+            slow.rng = Rng(0x5eed_1234);
+            slow.exhaustive = true;
+            let (mut fast_grid, mut slow_grid) = (grid(), grid());
+            let (mut ra, mut rb) = (Raster::new(cols, rows), Raster::new(cols, rows));
+            let (mut a, mut b) = (vec![], vec![]);
+            let mut frame = 0;
+            replay_clock(backdrop, cols, rows, 600, |fast, sound| {
+                let f = frame as f32;
+                let pointer = (frame % 97 < 40).then(|| (0.5 + (f * 0.05).sin() * 0.4, 0.5 + (f * 0.031).cos() * 0.4));
+                slow.fake_hms = fast.fake_hms;
+                slow.step([0.01, 0.0083, 0.016, 0.033][frame % 4], sound, pointer, cols, rows, 2.17);
+                frame += 1;
+                fast.draw(&mut ra, sound);
+                slow.draw(&mut rb, sound);
+                ra.recycle(&mut a);
+                rb.recycle(&mut b);
+                // The blank dark body of the dunes is all the slow clock adds.
+                let dark = b.iter().filter(|c| c.ch == ' ').count();
+                b.retain(|c| c.ch != ' ');
+                assert_eq!(a, b);
+                assert!(backdrop == SandBackdrop::Dunes || dark == 0);
+                fast_grid.fill(&a).unwrap();
+                slow_grid.fill(&b).unwrap();
+                assert!(fast_grid.cell_planes() == slow_grid.cell_planes());
+            });
+        }
+    }
+    // cargo test --release clock_draw_breakdown -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual cost report"]
+    fn clock_draw_breakdown() {
+        let (cols, rows, aspect) = (936, 279, 2.17);
+        let level: f32 = std::env::var("LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+        let sound = Sound { bass: level, treble: level * 0.7 };
+        for backdrop in [SandBackdrop::None, SandBackdrop::Chladni, SandBackdrop::Dunes, SandBackdrop::Galaxy] {
+            let mut c = SandClock::new(backdrop);
+            for _ in 0..100 {
+                c.step(0.01, &sound, Some((0.4, 0.5)), cols, rows, aspect);
+            }
+            let mut r = Raster::new(cols, rows);
+            let mut out = vec![];
+            let (mut back, mut grains, mut recycle) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let frames = 300;
+            for _ in 0..frames {
+                c.step(0.01, &sound, Some((0.4, 0.5)), cols, rows, aspect);
+                let t = Instant::now();
+                c.draw_backdrop(&mut r, &sound);
+                back += t.elapsed();
+                let t = Instant::now();
+                c.draw_grains(&mut r, &sound);
+                grains += t.elapsed();
+                let t = Instant::now();
+                r.recycle(&mut out);
+                recycle += t.elapsed();
+            }
+            let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
+            eprintln!(
+                "PARTS {:<8} backdrop {:6.3} grains {:6.3} recycle {:6.3} ms  grains {} back {} cells {}",
+                format!("{:?}", backdrop as u8), ms(back), ms(grains), ms(recycle), c.grains.len(), c.back.len(), out.len()
             );
         }
     }
