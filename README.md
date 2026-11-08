@@ -21,6 +21,8 @@ measured CPU cost of the effect, between 20 fps and the display's refresh
 rate. Interactive scenes drop to 30 fps while tiled windows cover their output
 or after 8 seconds with the cursor still and no sound, and come back on the
 next movement or note (`TTFX_BG_REST_FPS` sets that rate, 0 turns it off).
+On battery the ceiling drops to 20 fps until the charger is back;
+`TTFX_BG_ON_BATTERY=full` keeps the charger's pace.
 `--text-file` draws a UTF-8 text such as Omarchy's
 `~/.config/omarchy/branding/screensaver.txt`; `--audio` makes the effects react
 to what is playing.

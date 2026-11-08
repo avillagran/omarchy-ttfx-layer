@@ -16,7 +16,7 @@
 //! a screensaver look right from the first frame on any machine. A finer grid
 //! the user asked for raises the CPU budget by as much as it raises the work,
 //! up to `MAX_BUDGET`. On battery the ceiling drops to the lowest level, and it
-//! comes back when the charger does.
+//! comes back when the charger does; `TTFX_BG_ON_BATTERY=full` keeps it.
 //!
 //! With the grid on `auto`, the governor also learns how fine a grid the
 //! machine affords: a scene that holds the display's rate with room for more
@@ -387,12 +387,22 @@ fn on_battery(supplies: &Path) -> bool {
     mains
 }
 
+/// Whether the battery holds the scene at the lowest level: always on battery,
+/// unless the user chose to keep the charger's pace (`TTFX_BG_ON_BATTERY=full`).
+fn held_on_battery(supplies: &Path) -> bool {
+    battery_holds(std::env::var("TTFX_BG_ON_BATTERY").ok().as_deref()) && on_battery(supplies)
+}
+
+fn battery_holds(choice: Option<&str>) -> bool {
+    choice.map(str::trim) != Some("full")
+}
+
 /// A chosen limit gives way to the lowest level for as long as the charger is out.
 fn hold_battery_floor(fps: f64) {
     std::thread::Builder::new()
         .name("ttfx-fps-power".into())
         .spawn(move || loop {
-            set_cap(if on_battery(Path::new(POWER_SUPPLIES)) { LEVELS[0] } else { fps });
+            set_cap(if held_on_battery(Path::new(POWER_SUPPLIES)) { LEVELS[0] } else { fps });
             std::thread::sleep(PERIOD);
         })
         .expect("spawn fps power watch");
@@ -444,7 +454,7 @@ pub fn start_remembering(
         }
         Mode::Auto => {
             let supplies = Path::new(POWER_SUPPLIES);
-            let mut battery = on_battery(supplies);
+            let mut battery = held_on_battery(supplies);
             let remembered =
                 move |memory: &Option<PathBuf>| memory.as_deref().and_then(recall).unwrap_or(AUTO_START_FPS).min(top);
             let first = if battery { LEVELS[0] } else { remembered(&memory) };
@@ -486,7 +496,7 @@ pub fn start_remembering(
                         last_ticks = ticks;
                         let gpu_busy = gpu.as_mut().and_then(GpuSampler::take);
                         periods += 1;
-                        let unplugged = on_battery(supplies);
+                        let unplugged = held_on_battery(supplies);
                         if unplugged != battery {
                             battery = unplugged;
                             let cap = if battery { LEVELS[0] } else { remembered(&memory) };
@@ -599,7 +609,21 @@ mod tests {
         assert!(on_battery(&dir));
         supply("ac", "Mains", "1\n");
         assert!(!on_battery(&dir));
-        std::fs::remove_dir_all(dir).unwrap();
+        for name in ["usb", "bat", "ac"] {
+            let _ = std::fs::remove_file(dir.join(name).join("type"));
+            let _ = std::fs::remove_file(dir.join(name).join("online"));
+            std::fs::remove_dir(dir.join(name)).unwrap();
+        }
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_full_keeps_the_pace_on_battery() {
+        assert!(battery_holds(None));
+        assert!(battery_holds(Some("20fps")));
+        assert!(battery_holds(Some("off")));
+        assert!(!battery_holds(Some("full")));
+        assert!(!battery_holds(Some("full\n")));
     }
 
     #[test]

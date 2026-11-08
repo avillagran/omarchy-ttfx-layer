@@ -2691,6 +2691,9 @@ mod tests {
         let aim = h.aim.get().expect("the draw found the point under the cursor");
         let mut seen = 0;
         let mut eaten: f32 = 0.;
+        // One piece in seven is a rock, drawn at random: over the whole run,
+        // not in the first second, where a handful of pieces may hold none.
+        let mut rocks = false;
         for i in 0..800 {
             deep.step(0.05, &quiet, Some(gaze), gaze);
             let Deep::Horizon(h) = &deep else { unreachable!() };
@@ -2699,10 +2702,11 @@ mod tests {
                 // Born where the cursor is, not somewhere else.
                 let near = h.debris.iter().filter(|m| len(sub(m.p, aim)) < 2.5).count();
                 assert!(near * 2 > seen, "{near} of {seen} near the cursor");
-                assert!(h.debris.iter().any(|m| m.size > 0.), "some are rocks");
             }
+            rocks |= h.debris.iter().any(|m| m.size > 0.);
             eaten = eaten.max(h.gulp);
         }
+        assert!(rocks, "some are rocks");
         assert!(seen > 10, "the cursor threw debris in: {seen}");
         assert!(eaten > 0.02, "the hole swallowed some of it");
         let mut none = Horizon::new();
