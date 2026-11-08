@@ -28,6 +28,7 @@ mod interactive_eye;
 mod interactive_tunnel;
 mod neon_scenes;
 mod showcase_scenes;
+mod scenes3d;
 mod standalone_config;
 mod frame_wakeup;
 mod gpu_grid;

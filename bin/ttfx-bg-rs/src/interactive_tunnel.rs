@@ -556,6 +556,11 @@ impl Raster {
     pub(crate) fn fits(&self, cols: usize, rows: usize) -> bool {
         self.cols == cols && self.rows == rows
     }
+    /// Whether something nearer than `z` already holds the cell: lets a
+    /// costly shader skip what would be thrown away. The cell must be in range.
+    pub(crate) fn hidden(&self, x: usize, y: usize, z: f32) -> bool {
+        self.depth[y * self.cols + x] <= z
+    }
     /// Hand over the frame and leave the buffers ready for the next one.
     pub(crate) fn recycle(&mut self, out: &mut Vec<DirectCell>) {
         self.drain::<false>(out, false);
@@ -602,6 +607,35 @@ impl Raster {
     #[cfg(test)]
     pub(crate) fn finish(mut self, out: &mut Vec<DirectCell>) {
         self.recycle(out);
+    }
+    /// Light thrown on what is already drawn in `x0..x1` by `y0..y1`: each
+    /// cell brightens by `k(x, y)` (0 leaves it, 1 makes it glow), keeping
+    /// its hue. Empty and blank cells stay dark.
+    pub(crate) fn lift(&mut self, (x0, x1): (usize, usize), (y0, y1): (usize, usize), mut k: impl FnMut(usize, usize) -> f32) {
+        for y in y0..y1.min(self.rows) {
+            for x in x0..x1.min(self.cols) {
+                let i = y * self.cols + x;
+                if (self.drawn[i / 64] >> (i % 64)) & 1 == 0 {
+                    continue;
+                }
+                let m = &mut self.marks[i];
+                if m.ch == ' ' {
+                    continue;
+                }
+                let a = k(x, y).min(1.);
+                if a <= 0.01 {
+                    continue;
+                }
+                // Dim cells gain most, so a faint fill shows its colour too.
+                let peak = m.color.0.max(m.color.1).max(m.color.2).max(1) as f32;
+                let gain = (1. + a * 4.).max(a * 170. / peak);
+                let up = |v: u8| {
+                    let v = (v as f32 * gain).min(255.);
+                    (v + (255. - v) * a * 0.45) as u8
+                };
+                m.color = (up(m.color.0), up(m.color.1), up(m.color.2));
+            }
+        }
     }
     pub(crate) fn dot(&mut self, x: i32, y: i32, z: f32, ch: char, color: (u8, u8, u8)) {
         if x < 0 || y < 0 || x as usize >= self.cols || y as usize >= self.rows {

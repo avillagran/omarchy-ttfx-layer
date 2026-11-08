@@ -6,6 +6,7 @@ use crate::{
     asm_direct_bridge::DirectCell, interactive_matrix::Sound, interactive_tunnel::Raster,
     neon_scenes::variant,
 };
+mod sand;
 use std::f32::consts::{PI, TAU};
 type Color = (u8, u8, u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +20,24 @@ pub(crate) enum Kind {
     ChladniClock,
     DunesClock,
     GalaxyClock,
+    FerroClock,
+    ExcavationClock,
+    ZenClock,
+    FoundryClock,
+    SwarmClock,
+    ShoreClock,
+    GlassClock,
+    DevilClock,
+    SpectrumClock,
+    MandalaClock,
+    EventHorizon,
+    Supernova,
+    SolarSystem,
+    Abyss,
+    LoadCanyon,
+    NeonAvenue,
+    PacketGrid,
+    Silicon,
 }
 impl Kind {
     pub(crate) fn parse(name: &str) -> Option<Self> {
@@ -32,11 +51,29 @@ impl Kind {
             "sand-clock-chladni" => Self::ChladniClock,
             "sand-clock-dunes" => Self::DunesClock,
             "sand-clock-galaxy" => Self::GalaxyClock,
+            "sand-clock-ferrofluid" => Self::FerroClock,
+            "sand-clock-excavation" => Self::ExcavationClock,
+            "sand-clock-zen" => Self::ZenClock,
+            "sand-clock-foundry" => Self::FoundryClock,
+            "sand-clock-swarm" => Self::SwarmClock,
+            "sand-clock-shore" => Self::ShoreClock,
+            "sand-clock-glass" => Self::GlassClock,
+            "sand-clock-dust-devil" => Self::DevilClock,
+            "sand-clock-spectrum" => Self::SpectrumClock,
+            "sand-clock-mandala" => Self::MandalaClock,
+            "event-horizon" => Self::EventHorizon,
+            "supernova" => Self::Supernova,
+            "solar-system" => Self::SolarSystem,
+            "abyss" => Self::Abyss,
+            "load-canyon" => Self::LoadCanyon,
+            "neon-avenue" => Self::NeonAvenue,
+            "packet-grid" => Self::PacketGrid,
+            "silicon" => Self::Silicon,
             _ => return None,
         })
     }
     #[cfg(test)]
-    pub(crate) const ALL: [&'static str; 9] = [
+    pub(crate) const ALL: [&'static str; 27] = [
         "live-terminal",
         "data-globe",
         "aquarium",
@@ -46,7 +83,57 @@ impl Kind {
         "sand-clock-chladni",
         "sand-clock-dunes",
         "sand-clock-galaxy",
+        "sand-clock-ferrofluid",
+        "sand-clock-excavation",
+        "sand-clock-zen",
+        "sand-clock-foundry",
+        "sand-clock-swarm",
+        "sand-clock-shore",
+        "sand-clock-glass",
+        "sand-clock-dust-devil",
+        "sand-clock-spectrum",
+        "sand-clock-mandala",
+        "event-horizon",
+        "supernova",
+        "solar-system",
+        "abyss",
+        "load-canyon",
+        "neon-avenue",
+        "packet-grid",
+        "silicon",
     ];
+    /// The sand toys in `sand`.
+    fn toy(self) -> Option<sand::Toy> {
+        use sand::Toy;
+        Some(match self {
+            Self::FerroClock => Toy::Ferro,
+            Self::ExcavationClock => Toy::Excavation,
+            Self::ZenClock => Toy::Zen,
+            Self::FoundryClock => Toy::Foundry,
+            Self::SwarmClock => Toy::Swarm,
+            Self::ShoreClock => Toy::Shore,
+            Self::GlassClock => Toy::Glass,
+            Self::DevilClock => Toy::Devil,
+            Self::SpectrumClock => Toy::Spectrum,
+            Self::MandalaClock => Toy::Mandala,
+            _ => return None,
+        })
+    }
+    /// The solid 3D scenes in `scenes3d`.
+    fn solid(self) -> Option<crate::scenes3d::Which> {
+        use crate::scenes3d::Which;
+        Some(match self {
+            Self::EventHorizon => Which::Horizon,
+            Self::Supernova => Which::Supernova,
+            Self::SolarSystem => Which::Solar,
+            Self::Abyss => Which::Abyss,
+            Self::LoadCanyon => Which::Canyon,
+            Self::NeonAvenue => Which::City,
+            Self::PacketGrid => Which::Grid,
+            Self::Silicon => Which::Silicon,
+            _ => return None,
+        })
+    }
 }
 fn scale(c: Color, k: f32) -> Color {
     (
@@ -118,31 +205,50 @@ struct Terminal {
     wait: f32,
     rng: Rng,
 }
+/// Quattro's `omarchy <group> <command>` CLI, as typed today.
 const COMMANDS: [&str; 10] = [
-    "omarchy-update",
+    "omarchy update",
     "cargo build --release",
-    "omarchy-theme-set tokyo-night",
+    "omarchy theme set last-horizon",
     "hyprctl monitors",
-    "omarchy-pkg-add fs-uae",
+    "omarchy pkg add obsidian",
     "git log --oneline -5",
-    "omarchy-ambient start neon-city",
-    "make -j8",
-    "omarchy-screensaver",
-    "neofetch",
+    "omarchy-ambient start neon-avenue",
+    "omarchy version",
+    "omarchy screensaver",
+    "fastfetch",
 ];
-const LOGS: [&str; 12] = [
-    "hyprland: window mapped (ghostty)",
+const LOGS: [&str; 14] = [
+    "hyprland: window mapped (foot)",
     "pipewire: stream started 48000 Hz",
     "omarchy-ambient: scene ready",
     "wireplumber: default sink set",
     "systemd: user session active",
     "omarchy-shell: plugin reloaded",
+    "omarchy-bar: clock refreshed",
     "kernel: usb 2-1: new device",
-    "omarchy-idle: activity detected",
-    "walker: index refreshed",
-    "waybar: module updated",
-    "ghostty: font cache warm",
+    "hypridle: activity detected",
+    "omarchy-hyprland-monitor-watch: eDP-1 ready",
+    "foot: server ready",
+    "herdr: session restored",
+    "omarchy-theme-bg-switcher: cache warm",
     "network: wlan0 roamed to ap-02",
+];
+/// Omarchy Quattro's mark at half size, as fastfetch prints it beside the facts.
+const QUATTRO: [&str; 13] = [
+    "███████████████████████████",
+    "██           ██          ██",
+    "██  ███████████    ████  ██",
+    "██  ██               ██  ██",
+    "██  ██               ██  ██",
+    "██  ██               ██  ██",
+    "██████               ██  ██",
+    "██  ██               ██  ██",
+    "██  ██               ██  ██",
+    "██  ██               ██  ██",
+    "██  ███████████████████  ██",
+    "██           ██          ██",
+    "███████████████  ██████████",
 ];
 impl Terminal {
     fn new() -> Self {
@@ -167,83 +273,70 @@ impl Terminal {
         let cyan = (90, 210, 255);
         match cmd {
             0 => {
+                self.main.push("  :: snapshot @root taken".into(), dim, keep);
                 for p in [
-                    "hyprland 0.52.1-1",
-                    "omarchy 3.4.0",
-                    "linux 7.2.10",
-                    "ghostty 1.3.0",
+                    "omarchy 4.5.0-3",
+                    "hyprland 0.56.2-4",
+                    "linux 7.2.15-1-omarchy",
+                    "foot 1.28.0-2",
+                    "quickshell 0.3.2",
                 ] {
                     self.main.push(format!("  upgrading {p}"), white, keep);
                 }
-                self.main.push("  :: done · 4 packages".into(), green, keep);
+                self.main.push("  :: done · Omarchy Quattro 4.5 is up to date".into(), green, keep);
             }
             1 => {
                 for c in ["ttfx-bg-rs", "omarchy-ambient-layer", "wl-layer"] {
-                    self.main
-                        .push(format!("   Compiling {c} v0.2.1"), green, keep);
+                    self.main.push(format!("   Compiling {c} v0.6.0"), green, keep);
                 }
-                self.main.push(
-                    "    Finished release [optimized] in 21.4s".into(),
-                    green,
-                    keep,
-                );
+                self.main.push("    Finished release [optimized] in 18.9s".into(), green, keep);
             }
-            2 => self
-                .main
-                .push("  theme applied · 14 apps refreshed".into(), cyan, keep),
+            2 => self.main.push("  last-horizon on the shell · bar · foot · herdr · btop".into(), cyan, keep),
             3 => {
                 self.main.push("Monitor eDP-1 (ID 0):".into(), white, keep);
-                self.main
-                    .push("    3456x2234@120 at 0x0 · scale 2.0".into(), dim, keep);
+                self.main.push("    3456x2234@120 at 0x0 · scale 2.0".into(), dim, keep);
             }
             4 => {
-                self.main
-                    .push("resolving dependencies...".into(), dim, keep);
-                self.main
-                    .push("(1/1) installing fs-uae".into(), white, keep);
+                self.main.push("resolving dependencies...".into(), dim, keep);
+                self.main.push("(1/1) installing obsidian".into(), white, keep);
+                self.main.push("  launcher entry added".into(), green, keep);
             }
             5 => {
                 for (h, m) in [
-                    ("9ec0155", "Remove tunnel ring gates"),
-                    ("07b4121", "Light side facades"),
-                    ("6e6adc5", "Rework neon scenes"),
-                    ("92a05e3", "Raise lunar camera"),
-                    ("b502f29", "Restore original neon ridges"),
+                    ("2763a83", "Run scenes on the installed renderer"),
+                    ("3c50bc8", "Ship the background selector with the engine"),
+                    ("6e6167a", "Let scenes find their own frame rate and grid"),
+                    ("f71451b", "Bind Super+Ctrl+Space to the selector"),
+                    ("9e87b7e", "Require Omarchy 4.0 for the installer"),
                 ] {
                     self.main.push(format!("{h} {m}"), amber, keep);
                 }
             }
-            6 => self.main.push(
-                "  neon-city: audio reactive, layer bottom".into(),
-                cyan,
-                keep,
-            ),
-            7 => {
-                for o in ["layer.o", "dismiss.o", "wayland-protocols.o"] {
-                    self.main.push(format!("  CC  {o}"), dim, keep);
-                }
-                self.main
-                    .push("  LD  omarchy-ambient-layer.so".into(), white, keep);
-            }
-            8 => self
-                .main
-                .push("  screensaver: dismissed by activity".into(), dim, keep),
+            6 => self.main.push("  neon-avenue: follows the cursor and the music".into(), cyan, keep),
+            7 => self.main.push("4.5.0-3".into(), white, keep),
+            8 => self.main.push("  screensaver: dismissed by activity".into(), dim, keep),
             _ => {
-                for l in [
-                    "  ██████╗ ███╗   ███╗ █████╗ ██████╗  ██████╗██╗  ██╗██╗   ██╗",
-                    " ██╔═══██╗████╗ ████║██╔══██╗██╔══██╗██╔════╝██║  ██║╚██╗ ██╔╝",
-                    " ██║   ██║██╔████╔██║███████║██████╔╝██║     ███████║ ╚████╔╝ ",
-                    " ██║   ██║██║╚██╔╝██║██╔══██║██╔══██╗██║     ██╔══██║  ╚██╔╝  ",
-                    " ╚██████╔╝██║ ╚═╝ ██║██║  ██║██║  ██║╚██████╗██║  ██║   ██║   ",
-                    "  ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝   ",
-                ] {
-                    self.main.push(l.into(), cyan, keep);
+                let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+                let facts = [
+                    ("", "user@omarchy".to_string()),
+                    ("", "────────────".to_string()),
+                    ("OS", "Omarchy Quattro 4.5.0".to_string()),
+                    ("Kernel", "7.2.15-1-omarchy".to_string()),
+                    ("WM", "Hyprland 0.56.2".to_string()),
+                    ("Desktop", "omarchy-shell".to_string()),
+                    ("Terminal", "foot 1.28.0".to_string()),
+                    ("Theme", "last-horizon".to_string()),
+                    ("CPU", format!("{cores} cores")),
+                    ("Memory", format!("{:.0}% used", self.mem * 100.)),
+                ];
+                for (i, row) in QUATTRO.iter().enumerate() {
+                    let fact = match facts.get(i) {
+                        Some(("", v)) => v.clone(),
+                        Some((k, v)) => format!("{k}: {v}"),
+                        None => String::new(),
+                    };
+                    self.main.push(format!("  {row}   {fact}"), cyan, keep);
                 }
-                self.main.push(
-                    "  OS: Omarchy Linux  WM: Hyprland  Shell: omarchy-shell".into(),
-                    white,
-                    keep,
-                );
             }
         }
     }
@@ -299,6 +392,27 @@ impl Terminal {
             }
         }
     }
+    /// The top bar of Omarchy Quattro: workspaces, the clock, and what the
+    /// machine and the music are doing.
+    fn bar(&self, r: &mut Raster, cols: usize, sound: &Sound) {
+        let active = 1 + (self.script / 3) % 4;
+        let mut x = 1;
+        for w in 1..=5 {
+            let on = w == active;
+            text(r, x, 0, 3., &w.to_string(), if on { (235, 240, 245) } else { (90, 105, 120) });
+            if on {
+                r.dot(x + 1, 0, 3., '•', (120, 230, 140));
+            }
+            x += 3;
+        }
+        let (h, m, _) = local_hms();
+        let clock = format!("{h:02}:{m:02}");
+        text(r, (cols as i32 - clock.len() as i32) / 2, 0, 3., &clock, (220, 230, 240));
+        let cpu = self.cpu.iter().sum::<f32>() / self.cpu.len() as f32;
+        let level = ((sound.bass + sound.treble) * 4.).clamp(0., 4.) as usize;
+        let right = format!("♪ {}  cpu {:.0}%  mem {:.0}%", ["·", "▂", "▄", "▆", "█"][level], cpu * 100., self.mem * 100.);
+        text(r, cols as i32 - right.chars().count() as i32 - 2, 0, 3., &right, (150, 170, 190));
+    }
     fn draw(&self, r: &mut Raster, cols: usize, rows: usize, sound: &Sound, gaze: (f32, f32)) {
         let split = cols * 62 / 100;
         let border = (60, 80, 100);
@@ -308,27 +422,27 @@ impl Terminal {
             let py = ((gaze.1 + 1.) * 0.5 * rows as f32) as usize;
             (px < split) == (x < split) && ((py < rows / 2) == (y < rows / 2) || x < split)
         };
-        for y in 0..rows {
+        for y in 1..rows {
             r.dot(split as i32, y as i32, 5., '│', border);
         }
         for x in split..cols {
             r.dot(x as i32, (rows / 2) as i32, 5., '─', border);
         }
         r.dot(split as i32, (rows / 2) as i32, 4., '├', border);
-        text(r, 1, 0, 4., " shell ", (20, 30, 40));
-        for x in 1..8 {
-            r.dot(x as i32, 0, 3., ' ', (0, 0, 0));
-        }
-        text(r, 2, 0, 3., "shell", (140, 200, 240));
-        text(r, split as i32 + 2, 0, 3., "journal", (140, 200, 240));
-        text(
-            r,
-            split as i32 + 2,
-            (rows / 2) as i32 + 1,
-            3.,
-            "resources",
-            (140, 200, 240),
-        );
+        self.bar(r, cols, sound);
+        text(r, 2, 1, 3., "foot · ~/Work/omarchy-ambient", (140, 200, 240));
+        text(r, split as i32 + 2, 1, 3., "journalctl --user -f", (140, 200, 240));
+        text(r, split as i32 + 2, (rows / 2) as i32 + 1, 3., "btop", (140, 200, 240));
+        // The line under the cursor reads as selected.
+        let (px, py) = (((gaze.0 + 1.) * 0.5 * cols as f32) as i32, ((gaze.1 + 1.) * 0.5 * rows as f32) as i32);
+        let mark = |r: &mut Raster, x0: i32, y: i32| {
+            if y == py && (px < split as i32) == (x0 < split as i32) {
+                r.dot(x0 - 1, y, 5., '▌', (120, 230, 140));
+                true
+            } else {
+                false
+            }
+        };
         let top = 2i32;
         let mut y = top;
         let lines_fit = rows.saturating_sub(4);
@@ -340,7 +454,8 @@ impl Terminal {
         for (line, color) in &self.main.lines[start..] {
             let bright = if hot(1, y as usize) { 1. } else { 0.78 };
             let line: String = line.chars().take(split.saturating_sub(2)).collect();
-            text(r, 1, y, 6., &line, scale(*color, bright));
+            let color = if mark(r, 1, y) { mix(*color, (255, 255, 255), 0.6) } else { scale(*color, bright) };
+            text(r, 1, y, 6., &line, color);
             y += 1;
         }
         let cmd = COMMANDS[self.script % COMMANDS.len()];
@@ -367,7 +482,8 @@ impl Terminal {
                 .chars()
                 .take((cols - split).saturating_sub(2))
                 .collect();
-            text(r, lx, 2 + i as i32, 6., &line, *color);
+            let color = if mark(r, lx, 2 + i as i32) { (230, 240, 250) } else { *color };
+            text(r, lx, 2 + i as i32, 6., &line, color);
         }
         let by = (rows / 2) as i32 + 3;
         let width = (cols - split).saturating_sub(14).max(4) as f32;
@@ -376,7 +492,8 @@ impl Terminal {
             if yy as usize >= rows {
                 break;
             }
-            text(r, lx, yy, 6., &format!("cpu{i}"), (150, 165, 180));
+            let hover = mark(r, lx, yy);
+            text(r, lx, yy, 6., &format!("cpu{i}"), if hover { (235, 245, 255) } else { (150, 165, 180) });
             let n = (c * width) as usize;
             for k in 0..width as usize {
                 let col = if k < n {
@@ -384,6 +501,7 @@ impl Terminal {
                 } else {
                     (35, 45, 55)
                 };
+                let col = if hover { mix(col, (255, 255, 255), 0.35) } else { col };
                 r.dot(
                     lx + 6 + k as i32,
                     yy,
@@ -2090,6 +2208,12 @@ struct SandClock {
     field_figure: usize,
     time_key: u32,
     rng: Rng,
+    /// The cursor and the music read as gestures and events.
+    kit: sand::Kit,
+    hand: sand::Hand,
+    ear: sand::Ear,
+    /// A drop lights the whole clock for a moment.
+    flash: f32,
     /// Tests turn every shortcut off to compare the clock with itself.
     #[cfg(test)]
     exhaustive: bool,
@@ -2119,6 +2243,10 @@ impl SandClock {
             time: 0.,
             cursor: None,
             rng: Rng(rand::random()),
+            kit: sand::Kit::default(),
+            hand: sand::Hand::default(),
+            ear: sand::Ear::default(),
+            flash: 0.,
         }
     }
     /// ParticleClockAssignment.assign: pools grow to fit the glyph and never
@@ -2236,6 +2364,7 @@ impl SandClock {
             }
         }
         self.cursor = cursor;
+        self.gestures(dt, sound, cursor, cols, rows, aspect);
         let friction = (-dt * 3.5).exp();
         // 14% of the way per 60 Hz frame; the same curve at any frame rate.
         let frames = dt * 60.;
@@ -2267,6 +2396,70 @@ impl SandClock {
         }
         self.step_backdrop(dt, sound, cols, rows, aspect);
     }
+    /// Circling stirs a vortex, and a side to side shake or a drop blows the clock apart for a moment.
+    fn gestures(&mut self, dt: f32, sound: &Sound, cursor: Option<(f32, f32)>, cols: usize, rows: usize, aspect: f32) {
+        let kit = &mut self.kit;
+        kit.cols = cols;
+        kit.rows = rows;
+        kit.aspect = aspect.max(0.5);
+        kit.dt = dt;
+        kit.time = self.time;
+        kit.sound = *sound;
+        kit.reach = music_reach(rows);
+        self.hand.read(kit, cursor.map(|(x, y)| (x.clamp(0., cols as f32 - 1.), y.clamp(0., rows as f32 - 1.))));
+        self.ear.hear(kit);
+        let (time, reach, aspect) = (self.time, kit.reach, kit.aspect);
+        self.flash = (self.flash - dt * 1.2).max(0.);
+        // Away from `c`, in cells per second, as a unit vector in rows.
+        let away = |c: (f32, f32), x: f32, y: f32| {
+            let (dx, dy) = ((x - c.0) / aspect, y - c.1);
+            let d = (dx * dx + dy * dy).sqrt().max(0.3);
+            (dx / d, dy / d, d)
+        };
+        if let Some((c, rate)) = kit.swirl {
+            let radius = (rows as f32 * 0.32).max(4.);
+            let spin = (25. + rate.abs().min(3.) * 20.) * reach * rate.signum();
+            for g in &mut self.grains {
+                let (ux, uy, d) = away(c, g.x, g.y);
+                if d < radius {
+                    let f = (1. - d / radius) * dt * 9.;
+                    // Round the centre, and a little in towards it.
+                    g.vx += (-uy * spin - ux * 6. * reach) * aspect * f;
+                    g.vy += (ux * spin - uy * 6. * reach) * f;
+                    g.loose_until = g.loose_until.max(time + 0.9);
+                }
+            }
+            for g in &mut self.back {
+                let (ux, uy, d) = away(c, g.sx, g.sy);
+                if d < radius {
+                    let f = (1. - d / radius) * dt * 6.;
+                    g.vx += -uy * spin * aspect * f;
+                    g.vy += ux * spin * f;
+                }
+            }
+        }
+        if kit.shake || kit.drop {
+            let power = if kit.drop { 1.7 } else { 1. } * reach;
+            let c = (cols as f32 * 0.5, rows as f32 * 0.5);
+            for g in &mut self.grains {
+                let (ux, uy, _) = away(c, g.x, g.y);
+                let a = self.rng.next() * TAU;
+                let v = (30. + self.rng.next() * 70.) * power;
+                g.vx += (ux * 0.7 + a.cos() * 0.5) * v * aspect;
+                g.vy += (uy * 0.7 + a.sin() * 0.5) * v;
+                g.loose_until = time + 1.1 + self.rng.next() * 1.1;
+            }
+            for g in &mut self.back {
+                let a = self.rng.next() * TAU;
+                let v = (10. + self.rng.next() * 30.) * power;
+                g.vx += a.cos() * v * aspect;
+                g.vy += a.sin() * v;
+            }
+            if kit.drop {
+                self.flash = 1.;
+            }
+        }
+    }
     fn draw(&self, r: &mut Raster, sound: &Sound) {
         self.draw_backdrop(r, sound);
         self.draw_grains(r, sound);
@@ -2297,7 +2490,7 @@ impl SandClock {
             // Every grain catches the light on its own beat; treble adds to it.
             let glint = (self.time * (1.2 + g.speed * 1.6) + g.phase).sin().max(0.).powi(6);
             let sparkle = glint * (0.7 + sound.treble * 0.9);
-            let light = g.shade * (1.05 + sound.treble * 0.3 + sound.bass * 0.25) + sparkle * 0.6;
+            let light = g.shade * (1.05 + sound.treble * 0.3 + sound.bass * 0.25 + self.flash * 0.6) + sparkle * 0.6;
             // Without bass the offsets are zero: skip their sines.
             let (x, y) = if tremble == 0. && self.shortcuts() {
                 (g.x.round() as i32, g.y.round() as i32)
@@ -2630,6 +2823,8 @@ pub(crate) struct Showcase {
     jelly: Option<Jellyfish>,
     cockpit: Option<Cockpit>,
     sand_clock: Option<SandClock>,
+    sand: Option<sand::Sandbox>,
+    solid: Option<crate::scenes3d::Deep>,
     size: std::cell::Cell<Option<(usize, usize, f32)>>,
     raster: std::cell::RefCell<Option<Raster>>,
 }
@@ -2652,6 +2847,8 @@ impl Showcase {
                 Kind::GalaxyClock => Some(SandClock::new(SandBackdrop::Galaxy)),
                 _ => None,
             },
+            sand: kind.toy().map(sand::Sandbox::new),
+            solid: kind.solid().map(crate::scenes3d::Deep::new),
             size: std::cell::Cell::new(None),
             raster: std::cell::RefCell::new(None),
         }
@@ -2696,6 +2893,12 @@ impl Showcase {
         }
         if let Some(c) = &mut self.sand_clock {
             c.step(dt, &sound, pointer, cols, rows, aspect);
+        }
+        if let Some(s) = &mut self.sand {
+            s.step(dt, &sound, pointer, cols, rows, aspect);
+        }
+        if let Some(s) = &mut self.solid {
+            s.step(dt, &sound, pointer.map(|_| gaze), gaze);
         }
     }
     pub(crate) fn draw(&self, cols: usize, rows: usize, aspect: f32, out: &mut Vec<DirectCell>) {
@@ -2754,6 +2957,10 @@ impl Showcase {
             }
             Kind::SandClock | Kind::ChladniClock | Kind::DunesClock | Kind::GalaxyClock => {
                 self.sand_clock.as_ref().unwrap().draw(r, &self.sound)
+            }
+            Kind::FerroClock | Kind::ExcavationClock | Kind::ZenClock | Kind::FoundryClock | Kind::SwarmClock | Kind::ShoreClock | Kind::GlassClock | Kind::DevilClock | Kind::SpectrumClock | Kind::MandalaClock => self.sand.as_ref().unwrap().draw(r),
+            Kind::EventHorizon | Kind::Supernova | Kind::SolarSystem | Kind::Abyss | Kind::LoadCanyon | Kind::NeonAvenue | Kind::PacketGrid | Kind::Silicon => {
+                self.solid.as_ref().unwrap().draw(r, cols, rows, aspect, &self.sound, self.gaze)
             }
         }
     }
@@ -2949,10 +3156,19 @@ mod tests {
             bass: 0.6,
             treble: 0.5,
         };
-        for name in Kind::ALL {
+        // GRID=520x160 measures a fine grid; SCENES narrows the list.
+        let (cols, rows): (usize, usize) = std::env::var("GRID")
+            .ok()
+            .and_then(|g| {
+                let (c, r) = g.split_once('x')?;
+                Some((c.parse().ok()?, r.parse().ok()?))
+            })
+            .unwrap_or((300, 90));
+        let only = std::env::var("SCENES").unwrap_or_default();
+        for name in Kind::ALL.into_iter().filter(|n| only.is_empty() || only.split_whitespace().any(|o| o == *n)) {
             let mut s = Showcase::new(Kind::parse(name).unwrap());
             let mut frame = vec![];
-            s.draw(300, 90, 1.75, &mut frame);
+            s.draw(cols, rows, 1.75, &mut frame);
             for _ in 0..240 {
                 s.step(1. / 60., Some((0.4, 0.5)), loud);
             }
@@ -2964,7 +3180,7 @@ mod tests {
                 s.step(1. / 60., Some(pointer), loud);
                 step += t.elapsed();
                 let t = Instant::now();
-                s.draw(300, 90, 1.75, &mut frame);
+                s.draw(cols, rows, 1.75, &mut frame);
                 draw += t.elapsed();
             }
             let ms = |d: Duration| d.as_secs_f64() * 1000. / frames as f64;
