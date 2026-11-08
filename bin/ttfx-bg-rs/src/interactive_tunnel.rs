@@ -580,6 +580,10 @@ impl Raster {
         let mut print = if PRINT {
             self.drawn.iter().map(|bits| bits.count_ones() as u64).sum::<u64>() + 1
         } else { 0 };
+        // Cells come out in order, so the row only ever moves forward: no
+        // division per cell.
+        let cols = self.cols.max(1);
+        let (mut y, mut row) = (0usize, 0usize);
         for (word, bits) in self.drawn.iter_mut().enumerate() {
             let mut left = std::mem::take(bits);
             while left != 0 {
@@ -590,9 +594,13 @@ impl Raster {
                 if skip_blank && ch == ' ' && color == (0, 0, 0) {
                     continue;
                 }
+                if i - row >= cols {
+                    y = i / cols;
+                    row = y * cols;
+                }
                 let cell = DirectCell {
-                    x: i % self.cols,
-                    y: i / self.cols,
+                    x: i - row,
+                    y,
                     ch,
                     color,
                     background: None,
@@ -722,6 +730,7 @@ pub fn run(
     let mut cells = vec![];
     let mut last = Instant::now();
     let mut seen = false;
+    let mut rest = crate::fps_governor::Rest::new();
     while !stop.load(Ordering::Acquire) {
         let begin = Instant::now();
         let dt = (begin - last).as_secs_f32();
@@ -732,7 +741,8 @@ pub fn run(
             eprintln!("ASCII tunnel: spectral audio received");
             seen = true;
         }
-        tunnel.step(dt, pointer.sample(), input);
+        let point = pointer.sample();
+        tunnel.step(dt, point, input);
         tunnel.draw(cols, rows, aspect, &mut cells);
         {
             let mut slot = snapshot.lock().unwrap();
@@ -743,9 +753,10 @@ pub fn run(
             generation.fetch_add(1, Ordering::Release);
             wakeup.notify()?;
         }
-        let period = Duration::from_secs_f64(1. / crate::max_fps().unwrap_or(60.).clamp(1., 240.));
-        if let Some(rest) = period.checked_sub(begin.elapsed()) {
-            std::thread::sleep(rest);
+        let cap = crate::max_fps().unwrap_or(60.).clamp(1., 240.);
+        let period = Duration::from_secs_f64(1. / rest.ceiling(begin, point, input.bass, input.treble, crate::occlusion::current_covered(), cap));
+        if let Some(left) = period.checked_sub(begin.elapsed()) {
+            std::thread::sleep(left);
         }
     }
     Ok(())

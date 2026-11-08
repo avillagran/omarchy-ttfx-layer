@@ -17,7 +17,11 @@ The effects run in-process on the vendored `ttfx` engine (`ttfx-src/`; on
 x86-64 its NASM tiers are assembled when NASM is present). Glyphs come from
 Pango and are cached, drawing goes through EGL and OpenGL ES, and only the
 damaged region is presented. `--fps auto` picks the frame-rate ceiling from the
-measured CPU cost of the effect, between 20 and 60 fps. `--text-file` draws a UTF-8 text such as Omarchy's
+measured CPU cost of the effect, between 20 fps and the display's refresh
+rate. Interactive scenes drop to 30 fps while tiled windows cover their output
+or after 8 seconds with the cursor still and no sound, and come back on the
+next movement or note (`TTFX_BG_REST_FPS` sets that rate, 0 turns it off).
+`--text-file` draws a UTF-8 text such as Omarchy's
 `~/.config/omarchy/branding/screensaver.txt`; `--audio` makes the effects react
 to what is playing.
 

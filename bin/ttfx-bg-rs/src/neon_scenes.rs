@@ -1575,6 +1575,7 @@ pub fn run(
     let mut shown = 0;
     let mut last = Instant::now();
     let mut seen = false;
+    let mut rest = crate::fps_governor::Rest::new();
     eprintln!("neon scene: {style:?}, audio reactive");
     while !stop.load(Ordering::Acquire) {
         let begin = Instant::now();
@@ -1586,7 +1587,8 @@ pub fn run(
             eprintln!("neon scene: spectral audio received");
             seen = true;
         }
-        scene.step(dt, pointer.sample(), sound);
+        let point = pointer.sample();
+        scene.step(dt, point, sound);
         // A still frame costs the GPU and the battery nothing if never sent.
         // Fingerprint during hand-over, without reading the cell list again.
         let print = scene.draw_with_print(cols, rows, aspect, &mut cells);
@@ -1600,9 +1602,10 @@ pub fn run(
             generation.fetch_add(1, Ordering::Release);
             wakeup.notify()?;
         }
-        let period = Duration::from_secs_f64(1. / crate::max_fps().unwrap_or(60.).clamp(1., 240.));
-        if let Some(rest) = period.checked_sub(begin.elapsed()) {
-            std::thread::sleep(rest);
+        let cap = crate::max_fps().unwrap_or(60.).clamp(1., 240.);
+        let period = Duration::from_secs_f64(1. / rest.ceiling(begin, point, sound.bass, sound.treble, crate::occlusion::current_covered(), cap));
+        if let Some(left) = period.checked_sub(begin.elapsed()) {
+            std::thread::sleep(left);
         }
     }
     Ok(())

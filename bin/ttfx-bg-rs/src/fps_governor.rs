@@ -20,10 +20,18 @@
 //!
 //! With the grid on `auto`, the governor also learns how fine a grid the
 //! machine affords: a scene that holds the display's rate with room for more
-//! cells is remembered one or more density steps finer, and one that cannot
-//! hold it any more one step coarser. The grid is built when the scene starts,
-//! so what was learned shows from the next start; changing it live would make
-//! the picture jump.
+//! cells is remembered one or two density steps finer, and one that cannot
+//! hold it any more coarser. A finer grid is a luxury, so it may spend only
+//! `DENSITY_SHARE` of the budget: a cheap scene on a fast machine stays cheap
+//! instead of growing until it fills the budget. The grid is built when the
+//! scene starts, so what was learned shows from the next start; changing it
+//! live would make the picture jump.
+//!
+//! A background nobody is watching closely does not need the display's
+//! rate: while tiled windows cover it, or after `REST_AFTER` without the
+//! cursor moving or any sound, scenes drop to `REST_FPS`
+//! (`TTFX_BG_REST_FPS`, 0 turns it off) and climb back as soon as the
+//! desktop shows again and the cursor moves or a note plays.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -55,11 +63,15 @@ const MIN_TICKS_PER_PERIOD: u64 = 40;
 const EMA_ALPHA: f64 = 0.25;
 /// What one density step multiplies the cost of a frame by. A step has 1.78
 /// times the cells, but much of a frame does not grow with them: on the M2,
-/// four steps, ten times the cells, cost 2.7 times the CPU per frame. A guess
-/// that is off corrects itself: a grid too fine for the display's rate comes
-/// back down a step on the next start.
-const DENSITY_COST: f64 = 1.3;
-pub const MAX_LEARNED_DENSITY: i32 = 4;
+/// four steps cost 2.7 times the CPU per frame; on a Ryzen 5900X two steps
+/// cost 2.1 times. A guess that is off corrects itself: a grid too costly
+/// comes back down on the next start.
+const DENSITY_COST: f64 = 1.4;
+pub const MAX_LEARNED_DENSITY: i32 = 2;
+/// The share of the CPU budget a learned grid may spend at the display's
+/// rate. The rest of the budget is there to hold the frame rate, not to buy
+/// cells: at a quarter of a core, a finer grid gets 7.5%.
+const DENSITY_SHARE: f64 = 0.3;
 /// A finer grid must leave this much room at the display's rate, so the
 /// next start does not have to come down again.
 const DENSITY_MARGIN: f64 = 1.15;
@@ -166,15 +178,16 @@ pub fn pick_level(current: f64, a: Affordable, top: f64) -> f64 {
 }
 
 /// The density this period argues for: finer by as many steps as the room
-/// left at the display's rate pays for, or one step coarser when the scene
-/// no longer holds that rate.
+/// left at the display's rate pays for, coarser by as many as it lacks, and
+/// one step coarser when the scene no longer holds that rate.
 pub fn density_verdict(density: i32, cap: f64, top: f64, a: Affordable) -> i32 {
     if cap < top {
         return (density - 1).max(0);
     }
-    let room = a.cpu.min(a.gpu) / top / DENSITY_MARGIN;
-    let steps = if room > 1.0 { (room.ln() / DENSITY_COST.ln()).floor() as i32 } else { 0 };
-    (density + steps).min(MAX_LEARNED_DENSITY).max(density)
+    let room = (a.cpu * DENSITY_SHARE).min(a.gpu) / top / DENSITY_MARGIN;
+    // Saturating: an unmeasured cost makes the room infinite.
+    let steps = (room.ln() / DENSITY_COST.ln()).floor() as i32;
+    density.saturating_add(steps).clamp(0, MAX_LEARNED_DENSITY)
 }
 
 /// Where the grid density a scene affords is kept between runs.
@@ -183,13 +196,55 @@ pub fn density_path(scene: &str) -> Option<PathBuf> {
     Some(cache_dir()?.join(format!("density-{name}")))
 }
 
-/// The density learned for a scene, 0 when nothing was.
+/// The density learned for a scene, 0 when nothing was. One learned under a
+/// higher limit comes back at the limit.
 pub fn recall_density(path: &Path) -> i32 {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|d| (0..=MAX_LEARNED_DENSITY).contains(d))
-        .unwrap_or(0)
+        .filter(|d| *d >= 0)
+        .map_or(0, |d| d.min(MAX_LEARNED_DENSITY))
+}
+
+/// How long the cursor must rest, with no sound, before a scene slows down.
+pub const REST_AFTER: Duration = Duration::from_secs(8);
+/// The ceiling of a scene at rest: slow drift reads the same at 30 fps, and
+/// it divides 60, 120 and 144 Hz displays evenly enough to stay smooth.
+pub const REST_FPS: f64 = 30.0;
+/// Sound below this level, on both bands, counts as silence.
+const SILENCE: f32 = 0.03;
+
+/// Slows a producer down while nothing it reacts to is happening.
+pub struct Rest {
+    fps: Option<f64>,
+    point: Option<(f32, f32)>,
+    active: Instant,
+}
+impl Rest {
+    pub fn new() -> Self {
+        let fps = match std::env::var("TTFX_BG_REST_FPS").ok().as_deref().map(str::trim) {
+            Some("0" | "off") => None,
+            Some(v) => v.parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 1.0).or(Some(REST_FPS)),
+            None => Some(REST_FPS),
+        };
+        Self::with(fps, Instant::now())
+    }
+    fn with(fps: Option<f64>, now: Instant) -> Self {
+        Self { fps, point: None, active: now }
+    }
+    /// The ceiling for this frame: the rest rate while windows cover the
+    /// background or once the cursor and the sound have been still for
+    /// `REST_AFTER`, and `cap` otherwise.
+    pub fn ceiling(&mut self, now: Instant, point: Option<(f32, f32)>, bass: f32, treble: f32, covered: bool, cap: f64) -> f64 {
+        if point != self.point || bass > SILENCE || treble > SILENCE {
+            self.point = point;
+            self.active = now;
+        }
+        match self.fps {
+            Some(rest) if covered || now.duration_since(self.active) >= REST_AFTER => cap.min(rest),
+            _ => cap,
+        }
+    }
 }
 
 /// What the governor learns about the grid: where to keep it, and the
@@ -607,14 +662,22 @@ mod tests {
     #[test]
     fn room_at_the_display_rate_buys_finer_grids() {
         let cpu = |fps: f64| Affordable { cpu: fps, gpu: f64::INFINITY };
-        // At 60 fps a step needs 60 x 1.15 x 1.3 = 90 affordable, two need 117.
-        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(85.0)), 0);
-        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(91.0)), 1);
-        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(120.0)), 2);
+        // A grid gets 0.3 of the budget: at 60 fps a step needs
+        // 60 x 1.15 x 1.4 / 0.3 = 322 affordable, two need 451.
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(300.0)), 0);
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(330.0)), 1);
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(460.0)), 2);
         assert_eq!(density_verdict(0, 60.0, 60.0, cpu(100_000.0)), MAX_LEARNED_DENSITY);
-        assert_eq!(density_verdict(2, 60.0, 60.0, cpu(91.0)), 3, "counts from the grid it runs");
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(f64::INFINITY)), MAX_LEARNED_DENSITY);
+        assert_eq!(density_verdict(1, 60.0, 60.0, cpu(330.0)), 2, "counts from the grid it runs");
+        // A grid that costs more than its share comes back down, even at the display's rate.
+        assert_eq!(density_verdict(2, 60.0, 60.0, cpu(200.0)), 1);
+        assert_eq!(density_verdict(2, 60.0, 60.0, cpu(100.0)), 0);
+        assert_eq!(density_verdict(1, 60.0, 60.0, cpu(250.0)), 1, "holds between the two thresholds");
         // The M2 at 120 Hz: 1.24 ms a frame within a quarter of a core affords 202 fps.
-        assert_eq!(density_verdict(0, 120.0, 120.0, cpu(202.0)), 1);
+        assert_eq!(density_verdict(0, 120.0, 120.0, cpu(202.0)), 0);
+        // Sand Clock Zen on a Ryzen 5900X: 0.67 ms a frame affords 373 fps, one step.
+        assert_eq!(density_verdict(0, 60.0, 60.0, cpu(373.0)), 1);
         // Below the display's rate the grid gives way first, down to auto.
         assert_eq!(density_verdict(2, 40.0, 60.0, cpu(50.0)), 1);
         assert_eq!(density_verdict(0, 40.0, 60.0, cpu(50.0)), 0);
@@ -628,11 +691,34 @@ mod tests {
         let path = dir.join("density-neon-city");
         assert_eq!(recall_density(&path), 0);
         std::fs::create_dir_all(&dir).unwrap();
-        for (text, want) in [("2\n", 2), ("4", 4), ("5", 0), ("-1", 0), ("x", 0)] {
+        for (text, want) in [("2\n", 2), ("1", 1), ("4", 2), ("-1", 0), ("x", 0)] {
             std::fs::write(&path, text).unwrap();
             assert_eq!(recall_density(&path), want, "{text:?}");
         }
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scene_at_rest_slows_down_and_wakes_on_the_cursor_or_a_note() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        let mut rest = Rest::with(Some(30.0), t0);
+        let here = Some((0.5, 0.5));
+        assert_eq!(rest.ceiling(at(0.0), here, 0.0, 0.0, false, 60.0), 60.0);
+        assert_eq!(rest.ceiling(at(7.9), here, 0.0, 0.0, false, 60.0), 60.0);
+        assert_eq!(rest.ceiling(at(8.1), here, 0.0, 0.0, false, 60.0), 30.0);
+        assert_eq!(rest.ceiling(at(8.2), here, 0.0, 0.0, false, 24.0), 24.0, "never above the governor");
+        assert_eq!(rest.ceiling(at(9.0), Some((0.6, 0.5)), 0.0, 0.0, false, 60.0), 60.0, "the cursor wakes it");
+        assert_eq!(rest.ceiling(at(17.5), Some((0.6, 0.5)), 0.0, 0.0, false, 60.0), 30.0);
+        assert_eq!(rest.ceiling(at(18.0), Some((0.6, 0.5)), 0.2, 0.0, false, 60.0), 60.0, "music wakes it");
+        assert_eq!(rest.ceiling(at(25.0), Some((0.6, 0.5)), 0.01, 0.02, false, 60.0), 60.0);
+        assert_eq!(rest.ceiling(at(26.5), Some((0.6, 0.5)), 0.01, 0.02, false, 60.0), 30.0, "hiss is silence");
+        assert_eq!(rest.ceiling(at(27.0), None, 0.0, 0.0, false, 60.0), 60.0, "leaving the screen is a move");
+        assert_eq!(rest.ceiling(at(27.1), Some((0.2, 0.2)), 0.5, 0.0, true, 60.0), 30.0, "windows cover it, cursor or not");
+        assert_eq!(rest.ceiling(at(27.2), Some((0.3, 0.2)), 0.0, 0.0, false, 60.0), 60.0, "the desktop shows again");
+        let mut off = Rest::with(None, t0);
+        assert_eq!(off.ceiling(at(100.0), here, 0.0, 0.0, false, 60.0), 60.0);
     }
 
     #[test]

@@ -385,10 +385,16 @@ pub fn run(args: &[String]) -> Result<()> {
             let pointer = pointer.clone();
             let eye = opts.interactive_eye;
             let tunnel=opts.interactive_tunnel;let scene=opts.neon_scene;
+            // Scenes slow down while windows cover their output.
+            let output = opts.output.clone();
+            if pointer.is_some() && (scene.is_some() || tunnel) && output.is_some() {
+                crate::occlusion::start();
+            }
             let (cfg, effect, snapshot, generation, stop, wakeup) =
                 (cfg.clone(), effect.clone(), snapshot.clone(), generation.clone(), producer_stop.clone(), wakeup.clone());
             thread::Builder::new().name(format!("ttfx-gpu-{effect}")).spawn(move || {
                 if let Some(pointer) = pointer {
+                    if scene.is_some() || tunnel {crate::occlusion::set_current(output);}
                     if let Some(scene)=scene {crate::neon_scenes::run(scene,cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup)}
                     else if tunnel {crate::interactive_tunnel::run(cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup)}
                     else if eye { crate::interactive_eye::run(cols,rows,cell_aspect,pointer,snapshot,generation,stop,wakeup) }

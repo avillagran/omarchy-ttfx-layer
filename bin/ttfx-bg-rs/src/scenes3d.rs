@@ -133,12 +133,31 @@ fn hash3(x: i32, y: i32, z: i32) -> f32 {
             ^ (z as u32).wrapping_mul(83492791),
     )
 }
+/// `floor` without libm: on baseline x86-64 `f32::floor` is a function call,
+/// and the rasterizer and the noise run it tens of thousands of times a frame.
+fn flo(x: f32) -> f32 {
+    let i = x as i32 as f32;
+    if i > x {
+        i - 1.
+    } else {
+        i
+    }
+}
+/// `ceil` without libm, as `flo`.
+fn cei(x: f32) -> f32 {
+    let i = x as i32 as f32;
+    if i < x {
+        i + 1.
+    } else {
+        i
+    }
+}
 fn s3(t: f32) -> f32 {
     t * t * (3. - 2. * t)
 }
 /// Trilinear value noise in [0, 1).
 fn noise3(p: V) -> f32 {
-    let (xi, yi, zi) = (p[0].floor(), p[1].floor(), p[2].floor());
+    let (xi, yi, zi) = (flo(p[0]), flo(p[1]), flo(p[2]));
     let (fx, fy, fz) = (s3(p[0] - xi), s3(p[1] - yi), s3(p[2] - zi));
     let (x, y, z) = (xi as i32, yi as i32, zi as i32);
     let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
@@ -153,7 +172,7 @@ fn noise3(p: V) -> f32 {
 }
 /// Value noise in [0, 1) whose lattice repeats every `period` cells in z.
 fn noise2p(x: f32, z: f32, period: i32) -> f32 {
-    let (xi, zi) = (x.floor(), z.floor());
+    let (xi, zi) = (flo(x), flo(z));
     let (fx, fz) = (s3(x - xi), s3(z - zi));
     let (x, z0) = (xi as i32, (zi as i32).rem_euclid(period));
     let z1 = (z0 + 1) % period;
@@ -356,8 +375,8 @@ impl Canvas<'_> {
         if lo_x >= hi_x || lo_y >= hi_y {
             return;
         }
-        let (x0, x1) = ((lo_x - 0.5).max(0.).ceil() as usize, ((hi_x - 0.5).floor() as usize).min(self.cols - 1));
-        let (y0, y1) = ((lo_y - 0.5).max(0.).ceil() as usize, ((hi_y - 0.5).floor() as usize).min(self.rows - 1));
+        let (x0, x1) = (cei((lo_x - 0.5).max(0.)) as usize, (flo(hi_x - 0.5) as usize).min(self.cols - 1));
+        let (y0, y1) = (cei((lo_y - 0.5).max(0.)) as usize, (flo(hi_y - 0.5) as usize).min(self.rows - 1));
         // Each weight is linear along a row, and so is everything blended
         // from them: per row, solve for the span where all three weights
         // are non-negative and set up depth and attributes as a + b·x, so a
@@ -390,8 +409,8 @@ impl Canvas<'_> {
             if !(lo <= hi) {
                 continue;
             }
-            let xa = ((lo - 0.5).floor() as i64 - 1).max(x0 as i64) as usize;
-            let xb = ((hi - 0.5).ceil() as i64 + 1).min(x1 as i64);
+            let xa = (flo(lo - 0.5) as i64 - 1).max(x0 as i64) as usize;
+            let xb = (cei(hi - 0.5) as i64 + 1).min(x1 as i64);
             if xb < xa as i64 {
                 continue;
             }
@@ -1037,10 +1056,13 @@ impl Horizon {
                     ring = (1. - (b - B_CRIT) / (B_CRIT * 0.09)).max(0.);
                 }
                 if let Some((h, dir, path, r)) = hit {
-                    let a = h[2].atan2(h[0]).rem_euclid(TAU);
+                    // atan2 is within ±π: one add puts it in [0, τ) without fmod.
+                    let a = h[2].atan2(h[0]);
+                    let a = if a < 0. { a + TAU } else { a };
                     let temp = (INNER / r).powf(0.9);
-                    // Beaming: the side coming toward us burns brighter.
-                    let approach = -(dir[2] * a.cos() - dir[0] * a.sin());
+                    // Beaming: the side coming toward us burns brighter. The
+                    // angle's cosine and sine are the hit point over its radius.
+                    let approach = -(dir[2] * (h[0] / r) - dir[0] * (h[2] / r));
                     let doppler = (1. + 0.45 * approach * temp.sqrt()).powi(3);
                     let u = (a - kepler(r) * time) / TAU * 18.;
                     let streak = noise2p(r * 2.4, u, 18);
@@ -1663,7 +1685,18 @@ fn floor_h(x: f32, z: f32) -> f32 {
     big * 2.2 + mid * 0.45 + ripple - 2.
 }
 fn caustic(x: f32, z: f32, t: f32) -> f32 {
-    let c = (x * 1.1 + t * 0.9 + (z * kz(114.) + t * 0.5).sin()).sin() * (z * kz(212.) - t * 0.7 + (x * 0.8 - t * 0.4).sin()).sin();
+    caustic_with(x, z, t, caustic_row(z, t), caustic_column(x, t))
+}
+/// The parts of `caustic` that depend on one coordinate only, so a lattice
+/// can work them out once per row and once per column.
+fn caustic_row(z: f32, t: f32) -> f32 {
+    (z * kz(114.) + t * 0.5).sin()
+}
+fn caustic_column(x: f32, t: f32) -> f32 {
+    (x * 0.8 - t * 0.4).sin()
+}
+fn caustic_with(x: f32, z: f32, t: f32, row: f32, column: f32) -> f32 {
+    let c = (x * 1.1 + t * 0.9 + row).sin() * (z * kz(212.) - t * 0.7 + column).sin();
     (1. - c.abs()).powi(7)
 }
 struct Kelp {
@@ -1693,10 +1726,43 @@ pub(crate) struct Abyss {
     manta: f32,
     school: Vec<Fish>,
     lamp: Cell<Option<V>>,
+    heights: Cell<Lattice>,
     cursor: Option<(f32, f32)>,
     last_gaze: (f32, f32),
     pulse: Pulse,
     rng: Rng,
+}
+/// Values on a window of an integer lattice, kept from frame to frame.
+#[derive(Default)]
+struct Lattice {
+    x0: i32,
+    z0: i32,
+    w: usize,
+    h: usize,
+    v: Vec<f32>,
+}
+impl Lattice {
+    /// The window of `w` by `h` points from (`x0`, `z0`), row by row: points
+    /// the last window held are copied, the rest come from `f`.
+    fn refresh(&mut self, x0: i32, z0: i32, w: usize, h: usize, f: impl Fn(i32, i32) -> f32) -> &[f32] {
+        if (x0, z0, w, h) == (self.x0, self.z0, self.w, self.h) && self.v.len() == w * h {
+            return &self.v;
+        }
+        let old = std::mem::take(&mut self.v);
+        let held = |x: i32, z: i32| {
+            let (i, j) = (x - self.x0, z - self.z0);
+            (i >= 0 && j >= 0 && (i as usize) < self.w && (j as usize) < self.h).then(|| old[j as usize * self.w + i as usize])
+        };
+        let mut v = Vec::with_capacity(w * h);
+        for j in 0..h as i32 {
+            for i in 0..w as i32 {
+                let (x, z) = (x0 + i, z0 + j);
+                v.push(held(x, z).unwrap_or_else(|| f(x, z)));
+            }
+        }
+        *self = Self { x0, z0, w, h, v };
+        &self.v
+    }
 }
 impl Abyss {
     fn new() -> Self {
@@ -1712,7 +1778,7 @@ impl Abyss {
             .flat_map(|(kind, &(n, _, _))| (0..n).map(move |_| kind))
             .map(|kind| Fish { p: box_point(&mut rng), v: [0., 0., 0.], phase: rng.next() * TAU, kind })
             .collect();
-        Self { time: 0., z, cam_y, plankton, snow, waves: vec![], plume: vec![], manta: rng.next() * TAU, school, lamp: Cell::new(None), cursor: None, last_gaze: (0., 0.), pulse: Pulse::default(), rng }
+        Self { time: 0., z, cam_y, plankton, snow, waves: vec![], plume: vec![], manta: rng.next() * TAU, school, lamp: Cell::new(None), heights: Cell::default(), cursor: None, last_gaze: (0., 0.), pulse: Pulse::default(), rng }
     }
     fn eye(&self) -> V {
         [(self.time * 0.05).sin() * 4., self.cam_y, self.z]
@@ -1900,9 +1966,9 @@ impl Abyss {
         let fog = |depth: f32| (-depth * 0.065).exp();
         let sun = norm([0.5, 0.8, 0.25]);
         let caustic_gain = 0.75 + sound.treble * 0.6;
-        let light_at = |p: V, n: V| -> (f32, f32, f32) {
+        let light_with = |p: V, n: V, ca: f32| -> (f32, f32, f32) {
             let diff = dot(n, sun).max(0.);
-            let ca = caustic(p[0], p[2], t) * caustic_gain;
+            let ca = ca * caustic_gain;
             let lamp_k = lamp.map_or(0., |l| {
                 let d2 = (p[0] - l[0]).powi(2) + (p[2] - l[2]).powi(2);
                 (-d2 / 2.4).exp() * 1.3
@@ -1910,6 +1976,7 @@ impl Abyss {
             let bio = self.bio(p);
             (0.08 + diff * 0.62 + ca + lamp_k + bio * 0.8, lamp_k, bio)
         };
+        let light_at = |p: V, n: V| light_with(p, n, caustic(p[0], p[2], t));
         // The sand: a world-fixed grid, so it never swims.
         let step = 0.6;
         let x_lo = ((eye[0] - 22.) / step).floor() as i32;
@@ -1925,16 +1992,15 @@ impl Abyss {
             Some((block(l * f), mix(fog_col, scale(base, 0.3 + l * 0.75), f)))
         };
         // Heights once per vertex, with a one-vertex border for the normals.
+        // The lattice is fixed in the world, so a frame reuses what the last
+        // one computed and works out only the rows and columns it uncovers.
         let w = nx + 2;
-        let mut heights = vec![0f32; w * (nz + 2)];
-        for j in 0..nz + 2 {
-            let z = (z_lo + j as i32 - 1) as f32 * step;
-            for i in 0..w {
-                heights[j * w + i] = floor_h((x_lo + i as i32 - 1) as f32 * step, z);
-            }
-        }
+        let mut cache = self.heights.take();
+        let heights = cache.refresh(x_lo - 1, z_lo - 1, w, nz + 2, |i, j| floor_h(i as f32 * step, j as f32 * step));
+        let columns: Vec<f32> = (0..nx).map(|i| caustic_column((x_lo + i as i32) as f32 * step, t)).collect();
         for j in 0..nz {
             let z = (z_lo + j as i32) as f32 * step;
+            let wave = caustic_row(z, t);
             row.clear();
             for i in 0..nx {
                 let x = (x_lo + i as i32) as f32 * step;
@@ -1943,7 +2009,7 @@ impl Abyss {
                 // Relief exaggerated for the light, so dunes read at a glance.
                 let n = norm([(at(0, 1) - at(2, 1)) * 1.1, 0.6, (at(1, 0) - at(1, 2)) * 1.1]);
                 let p = [x, h, z];
-                let (l, lk, bio) = light_at(p, n);
+                let (l, lk, bio) = light_with(p, n, caustic_with(x, z, t, wave, columns[i]));
                 row.push(cv.vx(p, [l, lk, bio]));
             }
             if j > 0 {
@@ -1956,6 +2022,7 @@ impl Abyss {
             }
             std::mem::swap(&mut row, &mut row_prev);
         }
+        self.heights.set(cache);
         // Boulders, half sunk, on an 8-unit lattice.
         let tile = 8.;
         let per = (PERIOD / tile) as i32;
@@ -2108,14 +2175,17 @@ impl Abyss {
                 cv.dot(x, y, z, if m.life > 0.7 { ':' } else { '·' }, mix(fog_col, scale(sand, 0.4 + m.life * 0.6), f));
             }
         }
-        // Shafts of light from the surface, behind everything else.
+        // Shafts of light from the surface, behind everything else. The
+        // noise runs along one diagonal, so a frame samples its lattice once
+        // per column of it rather than once per cell.
         let top = (cv.rows as f32 * 0.7) as usize;
         let aspect = cam.aspect;
+        let shafts = Shafts::new(t * 0.08, gaze.0 * 0.4, (cv.cols as f32 / aspect + top as f32 * 0.55) * 0.22);
         for y in 0..top {
             let fall = 1. - y as f32 / top as f32;
             for x in 0..cv.cols {
                 let s = (x as f32 / aspect + y as f32 * 0.55) * 0.22 + gaze.0 * 0.4;
-                let n = noise3([s, 0.5, t * 0.08]);
+                let n = shafts.at(s);
                 if n > 0.64 {
                     let l = (n - 0.64) / 0.36 * fall * (0.7 + sound.treble * 0.4);
                     // Dithered, so a shaft is a haze rather than a slab.
@@ -2125,6 +2195,31 @@ impl Abyss {
                 }
             }
         }
+    }
+}
+/// `noise3([s, 0.5, z])` for every `s` of a frame: with y and z fixed the
+/// noise is a smooth blend between one value per lattice column.
+struct Shafts {
+    base: i32,
+    columns: Vec<f32>,
+}
+impl Shafts {
+    fn new(z: f32, from: f32, span: f32) -> Self {
+        let (zi, fz) = (z.floor() as i32, s3(z - z.floor()));
+        let base = from.floor() as i32;
+        let columns = (0..span.max(0.) as i32 + 3)
+            .map(|k| {
+                let at = |z: i32| (hash3(base + k, 0, z) + hash3(base + k, 1, z)) * 0.5;
+                at(zi) + (at(zi + 1) - at(zi)) * fz
+            })
+            .collect();
+        Self { base, columns }
+    }
+    fn at(&self, s: f32) -> f32 {
+        let i = flo(s);
+        let k = ((i as i32 - self.base).max(0) as usize).min(self.columns.len() - 2);
+        let (a, b) = (self.columns[k], self.columns[k + 1]);
+        a + (b - a) * s3(s - i)
     }
 }
 /// Rotation about the z axis.
@@ -2229,7 +2324,7 @@ impl Canyon {
         let row = &self.hist[k.min(self.hist.len() - 1)];
         let n = row.len().max(1);
         let f = (q - 0.5).clamp(0., n as f32 - 1.);
-        let i0 = f.floor() as usize;
+        let i0 = flo(f) as usize;
         let i1 = (i0 + 1).min(n - 1);
         let s = s3(f - i0 as f32);
         let v = row.get(i0).copied().unwrap_or(0.) * (1. - s) + row.get(i1).copied().unwrap_or(0.) * s;
@@ -2238,6 +2333,29 @@ impl Canyon {
         // Square root: an idle core still shows relief beside a busy one.
         let grain = noise2p(q * 1.7, (self.pushed as f32 - k as f32) * 0.35, 1 << 20) * 0.18;
         PEAK * (v / self.ceiling).clamp(0., 1.).sqrt() * ridge + 0.05 + grain + live
+    }
+    /// `height` over the whole lattice, `sub` vertices to a lane: what
+    /// depends only on the column or only on the row is worked out once.
+    fn heights(&self, nx: usize, sub: usize, sound: &Sound) -> Vec<f32> {
+        let qs: Vec<f32> = (0..nx).map(|i| i as f32 / sub as f32).collect();
+        let ridge: Vec<f32> = qs.iter().map(|q| 0.55 + 0.45 * (TAU * (q - 0.5)).cos()).collect();
+        let swell: Vec<f32> = qs.iter().map(|q| sound.bass * 0.4 * (q * 2.7 + self.time * 6.).sin()).collect();
+        let mut out = Vec::with_capacity(nx * self.hist.len());
+        for (k, row) in self.hist.iter().enumerate() {
+            let n = row.len().max(1);
+            let fade = (-(k as f32) * 0.25).exp();
+            let zg = (self.pushed as f32 - k as f32) * 0.35;
+            for (i, &q) in qs.iter().enumerate() {
+                let f = (q - 0.5).clamp(0., n as f32 - 1.);
+                let i0 = flo(f) as usize;
+                let i1 = (i0 + 1).min(n - 1);
+                let s = s3(f - i0 as f32);
+                let v = row.get(i0).copied().unwrap_or(0.) * (1. - s) + row.get(i1).copied().unwrap_or(0.) * s;
+                let grain = noise2p(q * 1.7, zg, 1 << 20) * 0.18;
+                out.push(PEAK * (v / self.ceiling).clamp(0., 1.).sqrt() * ridge[i] + 0.05 + grain + swell[i] * fade);
+            }
+        }
+        out
     }
     fn draw(&self, cv: &mut Canvas, sound: &Sound, gaze: (f32, f32)) {
         let Some(front) = self.hist.front() else { return };
@@ -2253,24 +2371,27 @@ impl Canyon {
         let dist = width.max(length) * 0.62 + 4.;
         cv.cam = Cam::look(orbit(target, az, el, dist), target, 1.1, cv.cols, cv.rows, cv.cam.aspect);
         let cam = cv.cam;
-        let sub_n = 4usize;
+        // Cells across one lane on screen. Each lane's ridge is a tent, so
+        // two triangles across it draw the same shape as four: four only
+        // pay where a lane is wide enough for the curve between lanes to show.
+        let spacing = cam.project([LANE_W, 0., 0.]).zip(cam.project([0., 0., 0.])).map_or(0., |(a, b)| (a.0 - b.0).abs());
+        let sub_n = if spacing < 14. { 2usize } else { 4 };
         let nx = n * sub_n + 1;
         let scroll = self.clock / TICK;
         let water = self.load.mem * PEAK;
         let light = norm([-0.45, 0.85, -0.4]);
         let rows = self.hist.len();
-        let mut heights = vec![0f32; nx * rows];
-        for k in 0..rows {
-            for i in 0..nx {
-                heights[k * nx + i] = self.height(k, i as f32 / sub_n as f32, sound);
-            }
-        }
+        let heights = self.heights(nx, sub_n, sound);
         let hx = LANE_W / sub_n as f32;
         let ceiling = self.ceiling;
+        // The height ramp, looked up rather than blended per cell.
+        let ramp: Vec<Color> = (0..=255)
+            .map(|k| grad(&[(0., (45, 30, 100)), (0.25, (40, 160, 190)), (0.55, (225, 60, 170)), (0.8, (255, 150, 50)), (1., (255, 245, 210))], k as f32 / 255.))
+            .collect();
         let mut paint = |a: [f32; 3], depth: f32| {
             let h = a[1];
             let v = (h / PEAK).clamp(0., 1.);
-            let base = grad(&[(0., (45, 30, 100)), (0.25, (40, 160, 190)), (0.55, (225, 60, 170)), (0.8, (255, 150, 50)), (1., (255, 245, 210))], v);
+            let base = ramp[(v * 255. + 0.5) as usize];
             let mut color = scale(base, 0.3 + a[0] * 0.85 + a[2] * 0.5);
             // The shore: where memory's level meets the terrain.
             let shore = 1. - (h - water).abs() / 0.12;
@@ -2339,7 +2460,6 @@ impl Canyon {
             cv.point(*p, if tw > 0.9 { '+' } else { speck(l) }, scale(color, 0.3 + l * 0.6));
         }
         let groups = SysLoad::groups(&self.load.cores, LANES);
-        let spacing = cam.project([LANE_W, 0., 0.]).zip(cam.project([0., 0., 0.])).map_or(0., |(a, b)| (a.0 - b.0).abs());
         for (i, (v, name)) in groups.iter().enumerate() {
             let x = (i as f32 + 0.5) * LANE_W;
             let h = self.height(0, i as f32 + 0.5, sound);
@@ -2438,6 +2558,36 @@ mod tests {
         out
     }
 
+    #[test]
+    fn the_canyon_lattice_matches_its_heights_one_by_one() {
+        let mut c = Canyon::new();
+        let loud = Sound { bass: 0.7, treble: 0.3 };
+        for _ in 0..30 {
+            c.step(0.1, &loud);
+        }
+        let n = c.hist.front().unwrap().len().max(1);
+        for sub in [2, 4] {
+            let nx = n * sub + 1;
+            let all = c.heights(nx, sub, &loud);
+            for k in 0..c.hist.len() {
+                for i in 0..nx {
+                    let one = c.height(k, i as f32 / sub as f32, &loud);
+                    assert!((all[k * nx + i] - one).abs() < 1e-4, "row {k} column {i}: {} vs {one}", all[k * nx + i]);
+                }
+            }
+        }
+    }
+    #[test]
+    fn light_shafts_sample_the_same_noise_as_before() {
+        for (z, from) in [(0.3, -2.7), (17.9, 0.0), (123.45, 5.5)] {
+            let shafts = Shafts::new(z, from, 60.);
+            for k in 0..600 {
+                let s = from + k as f32 * 0.1;
+                let (fast, slow) = (shafts.at(s), noise3([s, 0.5, z]));
+                assert!((fast - slow).abs() < 1e-5, "z {z} s {s}: {fast} vs {slow}");
+            }
+        }
+    }
     #[test]
     fn triangles_tile_without_holes_or_overlap_gaps() {
         // Two triangles of a quad cover every cell centre inside it once.

@@ -136,11 +136,24 @@ Text in these three is drawn in a 3x5 pixel font of half blocks, sized to the
 room it has: status lines grow with the grid, labels with how near their object
 is, and either falls back to plain characters where the font would not fit.
 
-Per-cell shading keeps libm out of the inner loops (`floor`, `fmod` and `exp`
-are calls on baseline x86-64), the rasterizer walks only the span a triangle
-covers on each row with depth and attributes set up as a + b·x, and each scene
-draws nearest first. On the M2 at 520x160 cells a frame of `neon-avenue` costs
-about 2.5 ms, `silicon` 1.1 ms and `packet-grid` 0.9 ms.
+Per-cell shading keeps libm out of the inner loops (`floor`, `ceil`, `fmod`
+and `exp` are calls on baseline x86-64), the rasterizer walks only the span a
+triangle covers on each row with depth and attributes set up as a + b·x, and
+each scene draws nearest first. Work that depends on one coordinate is done
+once per row or column: the abyss keeps its sand heights from frame to frame
+and samples its light shafts once per lattice column, the canyon builds its
+lattice in one pass and spends two triangles per lane wherever a lane is under
+14 cells wide. On the M2 at 520x160 cells a frame of `neon-avenue` costs about
+2.5 ms, `silicon` 1.1 ms and `packet-grid` 0.9 ms; on a Ryzen 5900X at the
+355x98 grid of a 1080p display, `abyss` costs 1.7 ms and `load-canyon` 1.4 ms.
+
+None of this needs the display's rate when nobody is looking closely: every
+scene drops to 30 fps while tiled windows cover its output (it only shows in
+the gaps and through translucent windows) or after 8 seconds with the cursor
+still and no sound, and climbs back on the next movement or note. A grid finer
+than `auto` is learned only while it costs under 30% of the CPU budget at the
+display's rate, at most two steps, so a cheap scene on a fast machine stays
+cheap instead of growing until it fills a quarter of a core.
 
 `/proc/stat` is read four times a second, `/proc/meminfo` and `/proc/loadavg`
 once a second, `/proc/net/dev` and `/proc/diskstats` twice a second, never per

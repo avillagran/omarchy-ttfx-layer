@@ -113,15 +113,8 @@ fn long_line(cv: &mut Canvas, a: V, b: V, piece: f32, color: impl Fn(f32) -> Opt
 
 // ----------------------------------------------------------- cell maths
 // The per-cell shaders run tens of thousands of times a frame: these keep
-// libm out of them (on baseline x86-64 even `floor` is a call).
-fn flo(x: f32) -> f32 {
-    let i = x as i32 as f32;
-    if i > x {
-        i - 1.
-    } else {
-        i
-    }
-}
+// libm out of them (on baseline x86-64 even `floor` is a call; `flo` is
+// the parent module's).
 fn fract(x: f32) -> f32 {
     x - flo(x)
 }
